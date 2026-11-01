@@ -37,7 +37,7 @@ class SkuRepository:
         logger.debug(f"get_by_sku: Executing query: {query}")
         result = db.execute_read_query_dict(self.connection, query)
 
-        if result and len(result) > 0:
+        if isinstance(result, list) and len(result) > 0:
             return result[0]
         return None
 
@@ -49,7 +49,7 @@ class SkuRepository:
         logger.debug(f"get_by_id: Executing query: {query}")
         result = db.execute_read_query_dict(self.connection, query)
 
-        if result and len(result) > 0:
+        if isinstance(result, list) and len(result) > 0:
             return result[0]
         return None
 
@@ -103,6 +103,6 @@ class SkuRepository:
         query = "SELECT MAX(Sku) as MaxSku FROM tbl_Skus;"
         logger.debug(f"get_max_sku: Executing query: {query}")
         result = db.execute_read_query_dict(self.connection, query)
-        if result and len(result) > 0 and "MaxSku" in result[0]:
+        if isinstance(result, list) and len(result) > 0 and "MaxSku" in result[0]:
             return result[0]["MaxSku"]
         return None

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Iceberg Accounting Suite
+Comment=Books, invoicing, reports, and reconciliation for small businesses
+Exec=iceberg
+Icon=iceberg
+Terminal=false
+Categories=Office;Finance;
+Keywords=accounting;invoice;ledger;bookkeeping;

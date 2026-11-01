@@ -3,3 +3,19 @@ __pycache__/
 *$py.class
 .coverage
 *.log
+.venv/
+backups/
+preferences.json
+build/
+dist/
+# PyInstaller writes <name>.spec next to the script when run ad hoc; the real spec lives in packaging/
+/*.spec
+node_modules/
+release/
+site/public/
+logs/
+Invoices/
+test.icb
+test2.icb
+testdb.icb
+*.icb.tmp

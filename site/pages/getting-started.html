@@ -1,0 +1,52 @@
+<!-- title: Getting started and support | description: Install Iceberg on Windows or Linux, open your first set of books, fix common problems, and report issues. -->
+<h1>Getting started</h1>
+<p class="lead">Three steps: install, create a database, keep the key safe.</p>
+
+<h2>1. Install</h2>
+<div class="cards">
+  <div class="card"><h3>Windows 10 / 11</h3><p>Download the installer from the <a href="downloads.html">downloads page</a>, verify its checksum, and run it. Choose per-user or per-machine installation. Windows already includes the Edge WebView2 runtime the window needs.</p></div>
+  <div class="card"><h3>Linux</h3><p>Download the archive, then:</p><pre><code>tar -xzf Iceberg-{{version}}-linux-x64.tar.gz
+cd Iceberg &amp;&amp; ./install.sh
+sudo apt install gir1.2-webkit2-4.1   # Debian/Ubuntu; Fedora: webkit2gtk4.1</code></pre><p>Or run <code>iceberg --browser</code> to use your web browser as the window.</p></div>
+  <div class="card"><h3>From source</h3><p>Python 3.11-3.14: <code>pip install -r requirements.txt</code> then <code>python webapp.py</code>. Details in <a href="{{repo}}/blob/master/docs/SETUP.md">docs/SETUP.md</a>.</p></div>
+</div>
+
+<h2>2. Create your first database</h2>
+<ol>
+  <li>On the Welcome screen choose <strong>Create New Database</strong>.</li>
+  <li>Enter the business name and address (they print on invoices) and your sales tax rate, or leave it at 0.00.</li>
+  <li>Choose a <strong>filekey folder</strong>. The <code>.icbkey</code> written there is the only way to open your books - put it somewhere your backups cover, such as a thumb drive or a synced folder, and never in the same place as the database alone.</li>
+  <li>Choose a receipts folder for receipt images and invoice PDFs, then select <strong>Create Database</strong>.</li>
+</ol>
+<p>The dashboard opens with a standard chart of accounts (checking, cash, receivables, common expense categories, sales). Record a transaction with <strong>+ New Transaction</strong>, add customers and services, and create an invoice.</p>
+
+<h2>3. Know where your files are</h2>
+<p><em>Tools → Where are my files</em> shows the data folder (<code>%LOCALAPPDATA%\Iceberg</code> on Windows, <code>~/.local/share/iceberg</code> on Linux) with your databases, backups, and logs. Iceberg saves automatically every five minutes when something changed, on every manual save, and when you close it. Backups are written on every save.</p>
+
+<h2>Troubleshooting</h2>
+<div class="table-scroll">
+<table>
+  <thead><tr><th>What you see</th><th>Why</th><th>What to do</th></tr></thead>
+  <tbody>
+    <tr><td>The window is blank (Windows)</td><td>The Edge WebView2 runtime is missing.</td><td>Install the WebView2 Runtime from Microsoft, then start Iceberg again.</td></tr>
+    <tr><td>"No webview backend is installed" (Linux)</td><td>WebKitGTK is not installed.</td><td><code>sudo apt install gir1.2-webkit2-4.1 python3-gi</code>, or start with <code>iceberg --browser</code>.</td></tr>
+    <tr><td>"The filekey does not match this database"</td><td>A different <code>.icbkey</code> was selected, or the file is damaged.</td><td>Select the key saved when the database was created. If the file is damaged, restore a backup (Tools → Restore from backup).</td></tr>
+    <tr><td>"Database not found"</td><td>The <code>.icb</code> is not in the databases folder.</td><td>Copy it into the folder shown under Tools → Where are my files.</td></tr>
+    <tr><td>"SAVE FAILED …" in the status line</td><td>Disk full, folder read-only, or the key file moved.</td><td>Your books are still open in memory. Fix the cause and select Save again.</td></tr>
+    <tr><td>A form refuses to save</td><td>A field failed validation.</td><td>The problem is written beneath the field in red; correct it and submit again.</td></tr>
+    <tr><td>Invoice PDF not written</td><td>The receipts folder no longer exists.</td><td>Set it again under Tools → Database properties; the PDF is regenerated when you select View PDF.</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Still stuck? Run the self-check from a terminal - <code>Iceberg.exe --check</code> on Windows, <code>./Iceberg --check</code> on Linux - it lists what is missing with the fix for each item.</p>
+
+<h2 id="support">Report an issue</h2>
+<div class="panel">
+  <p>Open an issue at <a href="{{repo}}/issues">{{repo}}/issues</a>. Please include:</p>
+  <ul class="checks">
+    <li>Iceberg version (Tools → About, or <code>Iceberg --version</code>) and your operating system.</li>
+    <li>What you did, what you expected, and what happened - the text of any message in the status line.</li>
+    <li>The last lines of <code>logs/iceberg.log</code> from the data folder (Tools → Where are my files). The log contains no account numbers or amounts beyond what you typed into console-visible actions.</li>
+  </ul>
+  <p>Please do not attach your <code>.icb</code> or <code>.icbkey</code>.</p>
+</div>

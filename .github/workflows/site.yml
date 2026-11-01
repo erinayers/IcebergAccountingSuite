@@ -1,0 +1,36 @@
+name: Website
+
+# Builds site/ and publishes it to GitHub Pages (ST-027 to ST-031).
+on:
+  push:
+    branches: [master, main]
+    paths: ["site/**", "docs/screens/**", "version.py", "packaging/iceberg-256.png"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build and check the site
+        run: python site/build.py --check
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/public
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

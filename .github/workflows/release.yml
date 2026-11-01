@@ -1,0 +1,80 @@
+name: Release
+
+# Builds, verifies, and packages Iceberg for every supported platform when a
+# version tag is pushed (v2.0.0), then publishes a GitHub release with the
+# archives, installer, checksums, and the CHANGELOG section as release notes.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: System packages (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y gir1.2-webkit2-4.1 python3-gi
+      - name: Inno Setup (Windows)
+        if: runner.os == 'Windows'
+        run: choco install innosetup --no-progress -y
+      - name: Install dependencies from prebuilt wheels only
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --only-binary=:all: --no-binary proxy_tools -r requirements.txt
+          python -m pip install pyflakes
+      - name: Version must match the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(python -c "from version import VERSION; print(VERSION)")
+          test "v$version" = "${GITHUB_REF_NAME}" || { echo "version.py says $version but tag is ${GITHUB_REF_NAME}"; exit 1; }
+      - name: Release checks
+        run: python scripts/check_release.py
+      - name: Build, verify, package
+        run: python scripts/build_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iceberg-${{ matrix.os }}
+          path: release/
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect artifacts and checksums
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name "Iceberg-*" -o -name "SHA256SUMS-*" \) -exec cp {} release/ \;
+          cat release/SHA256SUMS-*.txt > release/SHA256SUMS.txt
+          cp "$(find artifacts -name RELEASE_NOTES.md | head -1)" release/RELEASE_NOTES.md
+          ls -la release
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Iceberg ${{ github.ref_name }}
+          body_path: release/RELEASE_NOTES.md
+          files: |
+            release/Iceberg-*
+            release/SHA256SUMS.txt

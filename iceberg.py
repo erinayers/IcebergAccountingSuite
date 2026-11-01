@@ -1,3 +1,10 @@
+# Startup checks run before the GUI toolkit is imported so that a missing
+# Tcl/Tk, PySimpleGUI, package, or data file produces a readable message
+# instead of a traceback (ST-002).  They also change into the application
+# folder so the relative data paths used below always resolve.
+import startup_checks
+STARTUP_WARNINGS = startup_checks.ensure_ready_or_exit()
+
 import PySimpleGUI  as sg
 
 import ast
@@ -22,8 +29,6 @@ from cryptography.fernet import Fernet
 
 import os
 import sys
-sys.path.append('PATH')
-from tkinter import *
 from PIL import ImageTk, Image
 import string
 
@@ -31,6 +36,17 @@ from PIL import ImageDraw, ImageFont
 import img2pdf
 import subprocess
 from iceberg_utils import get_current_time_info, format_currency, convert_dollars_to_cents, id_generator
+import iceberg_time
+import backups
+import accounting
+import validation
+import reconciliation
+import reports
+import invoice_lifecycle
+import data_exchange
+import books
+from session import IcebergSession, open_session_log, save_session_log, AUTOSAVE_INTERVAL_SECONDS
+from ui import theme as ui_theme, preferences, navigation, tables, feedback, forms, accessibility
 import logging
 
 from repository import PropertyRepository, VendorRepository, SkuRepository, AccountRepository, InvoiceRepository, CustomerRepository
@@ -42,99 +58,87 @@ from repository import OwnerRepository
 
 sample_date = parser.parse('2023-04-02')
 
-now= datetime.datetime.now()
-current_date = now.date()
+# Timestamps written to the database are UTC (iceberg_time.storage_timestamp);
+# anything shown to the user is converted to local time at display time.
+# ``now`` is only used for the startup year; do not reuse it for records.
+now = iceberg_time.local_now()
 current_year = now.year
-week_past = current_date - datetime.timedelta(6)
 
 
 #------------------------------------------Section 2 Load Initial Data
 
 
-#Instantiate a class for the session
-class new_session:
-    def __init__(self):
-        self.current_time_display = get_current_time_info()
-        self.ledger_name = ""
-        self.synchronized = "No"
-        self.connection = False
-        self.num = 1
-        self.guitimer="Initializing"
-        self.db_name = ""
-        self.filekey = ""
-        self.filename = ""
-        self.database_loaded = False
-        self.vendor_number = int(0)
-        self.save_location = False
-        self.account_number = False
-        self.window = False
-        self.vendors = []
-        self.transactions = []
-        self.transaction_date = datetime.datetime.now()
-        self.all_accounts = []
-        self.current_date = f"{datetime.datetime.now().year}/{datetime.datetime.now().month}/{datetime.datetime.now().day}"
-        self.business_name = []
-        self.business_address = []
-        self.owner_name = []
-        self.owner_title = []
-        self.owner_phone = []
-        self.owner_email = []
-        self.owner_notes = []
-        self.business_ein = []
-        self.customers= []
-        self.current_year = now.year
-        self.receipts_location = "."
-        self.current_console_messages = [f"""Welcome to Iceberg Accounting Suite! Create or open a database to get started."""]
-        self.session_filekey, self.session_filename, self.session_save_location= db.encrypt_database("sessions.icbs","decrypt","sessions.icbskey",False,"sessions.icbs")
-        session_log_connection = db.create_connection("sessions.icbs")
-        self.session_log_connection = db.load_db_to_memory(session_log_connection)
-        self.session_filekey, self.session_filename, self.session_save_location= db.encrypt_database("sessions.icbs","encrypt","sessions.icbskey",False,"sessions.icbs")
-        self.customer_number = 0
-        #print(self.session_filekey)
-        self.invoices= []  
-        self.service_number = 0
-        self.services = []
-        self.transaction = ""
-        self.these_customers = []
-        self.these_skus = []
-        self.sales_tax = 0.00
-        self.these_line_items = []
-        self.this_invoice = {"Invoice_ID":"","Line_Items":"", "Tracking_Code":"",
-                             "Customer_ID":"","Subtotal": "", "Sales_Tax":"",
-                             "Total":"","Status":"","Payment_Method":"","Location":"", "Due_Date": ""}
-        self.transaction_debit_account = ""
+def normalized_save_location(save_location):
+    """Return the filekey folder with a trailing slash ('./' when unset)."""
+    if save_location in (None, False, "", "."):
+        return "./"
+    if save_location[-1] != "/":
+        return save_location + "/"
+    return save_location
 
-    def console_log(self, message, current_console_messages):#
-        """Posts a message to the console and logs it in the database.."""
-        self.current_time_display = get_current_time_info()
-        this_message = f"""Console ({self.current_time_display[1]}): {message}"""
-        full_message = f"""{this_message}"""
-        for i in range(len(current_console_messages)):
-            full_message = full_message + f"""\n{current_console_messages[i]}"""
-        
-        self.window["-Console_Log-"].update(full_message)
-        current_console_messages = [this_message] + current_console_messages           
 
-        
+def save_current_database(session, reason="Manual save"):
+    """Atomically save the open database and report the outcome (ST-003).
 
-        insert_log_entry_query = f"""INSERT INTO tbl_Console_Log (Console_Messages, Created_Time, Edited_Time)
-            VALUES(("{this_message}"),("{self.current_time_display[1]}"),("{self.current_time_display[1]}"));
-        """
-        created_session_entry = db.execute_query(self.session_log_connection,insert_log_entry_query)
-        full_message = full_message + f"""\nConsole ({self.current_time_display[0]}): {created_session_entry}"""
+    The result is written to the console log (which is itself stored in the
+    database, giving an audit trail of saves) and a failure is also shown in
+    a dialog so it cannot be missed.  Returns the SaveResult.
+    """
+    if not session.database_loaded or not session.connection:
+        result = db.SaveResult(False, f"{reason}: nothing to save - no database is open.")
+        session.current_console_messages = session.console_log(result.message, session.current_console_messages)
+        return result
+    session.save_location = normalized_save_location(session.save_location)
+    result, session.connection = db.save_database(
+        session.connection, session.db_name, session.filename, session.save_location
+    )
+    session.current_console_messages = session.console_log(f"{reason}: {result.message}", session.current_console_messages)
+    if result.ok:
+        session.last_autosave = iceberg_time.monotonic()
+        session.mark_saved()
+        feedback.notify(session.window, THEME, f"{reason}: saved {os.path.basename(result.path)} and wrote a backup.", "success")
+        refresh_save_state(session)
+    else:
+        feedback.notify(session.window, THEME, f"{reason} FAILED - {result.message}", "error")
+        sg.popup_error(
+            f"{reason} failed.\n\n{result.message}\n\nYour books are still open in memory. "
+            "Fix the problem (disk space, permissions, filekey location) and choose File > Save Database again.",
+            title="Iceberg - save failed",
+        )
+    return result
 
-        if self.connection:     
-            insert_log_entry_query = f"""INSERT INTO tbl_Console_Log (Console_Messages, Created_Time, Edited_Time)
-                VALUES(("{this_message}"),("{self.current_time_display[1]}"),("{self.current_time_display[1]}"));
-            """
-            created_entry = db.execute_query(self.connection,insert_log_entry_query)
-            full_message = full_message + f"""\nConsole ({self.current_time_display[0]}): {created_entry}"""
-        return current_console_messages
 
-icb_session = new_session()
-print(icb_session.transaction_date)
-print(icb_session.current_date)
-#print(icb_session.guitimer)
+def refresh_clock_and_autosave(session):
+    """Called on every GUI timeout and event (ST-005).
+
+    Updates the clock whenever the displayed minute changes and autosaves
+    every AUTOSAVE_INTERVAL_SECONDS measured with a monotonic clock, so the
+    behaviour does not depend on the system timezone, DST changes, or how
+    the operating system names the zone.
+    """
+    session.current_time_display = get_current_time_info()
+    if session.current_time_display[0] != session.displayed_time:
+        session.displayed_time = session.current_time_display[0]
+        session.window['-Current_Time_Display-'].update(session.displayed_time)
+    if session.database_loaded and iceberg_time.monotonic() - session.last_autosave >= AUTOSAVE_INTERVAL_SECONDS:
+        if session.has_unsaved_changes():
+            save_current_database(session, reason="Autosave")
+        else:
+            session.last_autosave = iceberg_time.monotonic()
+    refresh_save_state(session)
+
+
+def refresh_save_state(session):
+    """Keep the unsaved-changes / autosave countdown label current (ST-018)."""
+    unsaved = session.has_unsaved_changes()
+    text = feedback.save_state_text(session.database_loaded, unsaved, session.last_saved_display, session.seconds_until_autosave())
+    if text != session.displayed_save_state:
+        session.displayed_save_state = text
+        feedback.update_save_state(session.window, THEME, text, unsaved)
+
+
+icb_session = IcebergSession()
+TABLE_SORTER = tables.TableSorter()
 
 #Set fixed variables
 
@@ -145,12 +149,16 @@ phone_types = ["Mobile","Home", "Office", "Work", "Other"]
 account_types = [[0,"Assets"],[1,"Expenses"],[2,"Equity Withdrawals"],[3,"Liabilities"],[4,"Owner Equity"],[5,"Revenue"]]
 bank_account_types = [[0,"Checking"],[1,"Savings"],[2,"Passbook"],[3,"Certificate of Deposit"]]
 
-small_print = 8
-medium_print = 11
-large_print = 16
-extra_large_print = 24
-detailed_information_color="#dcfffe"
-overview_information_color = "#bbf0f9"
+# Visual system (ST-014) driven by the user's display preferences (ST-020).
+PREFS = preferences.load()
+THEME = ui_theme.from_preferences(PREFS)
+THEME.apply(sg)
+small_print = THEME.small
+medium_print = THEME.medium
+large_print = THEME.large
+extra_large_print = THEME.xlarge
+detailed_information_color = THEME.color("panel")
+overview_information_color = THEME.color("panel_alt")
 
 #financials (SAMPLE DATA)
 total_credits = "$0.00"
@@ -168,7 +176,6 @@ business_income = "$0.00"
 
 #------------------------------------------Section 3 GUI Layout
 
-sg.theme('LightBlue3')
 
 #import psutil
 
@@ -186,27 +193,27 @@ index = 0
                                                                                      
 
 menu_def = [
-    ['&File',['&New Database','&Open Database','!&Save Database','!Database &Properties','E&xit Iceberg']],
+    ['&File',['&New Database','&Open Database','!&Save Database','!&Restore from Backup','!Database &Properties','E&xit Iceberg']],
     ['&Dashboard',['!&Go to Dashboard']],
-    ['&Ledger',['!&View Ledger','!&New Transaction']],
-    ['&Reports',['!&Profit and Loss', '!Profit and Loss by &Month','!&Quarterly Report']],
+    ['&Ledger',['!&View Ledger','!&New Transaction','!&Reconcile Account','!&Import Transactions from CSV','!&Export Ledger to CSV']],
+    ['&Reports',['!&Income Statement', '!Income Statement by &Month','!&Balance Sheet','!&Cash Flow','!&Export All Data to CSV']],
     ['&Vendors',['!&View Vendors', '!&New Vendor']],
     ['&Customers',['!&View Customers', '!&New Customer','!&Point of Sale']],
     ['&Products',['!&View Products','!&New Product','!New &Lot']],
     ['&Services',['!&View Services','!&New Service']],
-    ['&Help',['&Documentation', '&About']]
+    ['&Help',['&Documentation', 'Keyboard &Shortcuts', '&Preferences', '&About']]
 ]
 
 menu_def_2 = [
-    ['&File',['&New Database','&Open Database','&Save Database','Database &Properties','E&xit Iceberg']],
+    ['&File',['&New Database','&Open Database','&Save Database','&Restore from Backup','Database &Properties','E&xit Iceberg']],
     ['&Dashboard',['&Go to Dashboard']],
-    ['&Ledger',['&View Ledger','&New Transaction']],
-    ['&Reports',['!&Profit and Loss', '!Profit and Loss by &Month','!&Quarterly Report']],
+    ['&Ledger',['&View Ledger','&New Transaction','&Reconcile Account','&Import Transactions from CSV','&Export Ledger to CSV']],
+    ['&Reports',['&Income Statement', 'Income Statement by &Month','&Balance Sheet','&Cash Flow','&Export All Data to CSV']],
     ['&Vendors',['&View Vendors', '&New Vendor']],
     ['&Customers',['&View Customers', '&New Customer','&Point of Sale']],
     ['&Products',['!&View Products','!&New Product','!New &Lot']],
     ['&Services',['&View Services','&New Service']],
-    ['&Help',['&Documentation', '&About']]
+    ['&Help',['&Documentation', 'Keyboard &Shortcuts', '&Preferences', '&About']]
 ]
 account_information_labels_width = 20
 
@@ -281,7 +288,7 @@ dashboard_column_layout = [
 #Create the chart of accounts display
 icb_session.db_name = "Select or Create Database"
 chart_of_accounts_text_layout = [
-    [sg.Table(values=[],row_height=36, bind_return_key=True, col_widths=[10,32,12,12,12], cols_justification=["c","c","c","c","c"], auto_size_columns=False, headings=["Account_ID", "Name", "Credits", "Debits", "Balance"], num_rows=25, expand_x=True, expand_y=True, font=("",medium_print), enable_events=False, justification="Center", key="-Chart_of_Accounts_Content-", background_color=detailed_information_color)],
+    [sg.Table(values=[], enable_click_events=True, alternating_row_color=THEME.color('table_alt'), text_color=THEME.color('table_text'), header_font=THEME.font('medium', bold=True),row_height=36, bind_return_key=True, col_widths=[10,32,12,12,12], cols_justification=["c","l","r","r","r"], auto_size_columns=False, headings=["Account_ID", "Name", "Credits", "Debits", "Balance"], num_rows=25, expand_x=True, expand_y=True, font=("",medium_print), enable_events=False, justification="Center", key="-Chart_of_Accounts_Content-", background_color=detailed_information_color)],
 ]
 
 database_years = ["All Years"]
@@ -312,9 +319,28 @@ dashboard_tab = [
 #        [sg.Text("Year: ", font=("",large_print), size=(14,1)), sg.OptionMenu(values=["CY2024","CY2023"], auto_size_text=True, default_value="CY2024",key="-Ledger_Year_Picker-")],
 #]
 
+report_period_default = reports.period_bounds("This Year")
+
 reports_tab = [
-    [sg.Text(font=("",medium_print), size=(133,1))],
-    [sg.Text("Reports")],
+    [sg.Text("Report: ", font=("",medium_print)), sg.Combo(reports.REPORT_TYPES, default_value="Income Statement", readonly=True, enable_events=True, size=(26,1), key="-Report_Type-"),
+     sg.Text("Period: ", font=("",medium_print)), sg.Combo(reports.PERIOD_PRESETS, default_value="This Year", readonly=True, enable_events=True, size=(16,1), key="-Report_Period-"),
+     sg.Text("From: "), sg.Input(report_period_default[0], size=(11,1), key="-Report_Start-"), sg.CalendarButton("Select", format="%Y-%m-%d", key="-Report_Start_Cal-"),
+     sg.Text("To: "), sg.Input(report_period_default[1], size=(11,1), key="-Report_End-"), sg.CalendarButton("Select", format="%Y-%m-%d", key="-Report_End_Cal-"),
+     sg.Button("Run Report", key="-Run_Report-"), sg.Button("Export CSV", key="-Export_Report-")],
+    [sg.Text("Balance Sheet uses the 'To' date. Cash Flow uses the checking, cash, and bank-linked asset accounts.", font=("",small_print))],
+    [sg.Multiline("Choose a report and period, then select Run Report.", font=("Courier",medium_print), size=(118,34), expand_x=True, expand_y=True, disabled=True, background_color=detailed_information_color, key="-Report_Output-")],
+]
+
+reconcile_tab = [
+    [sg.Text("Reconcile an account against a statement", font=("",large_print), key="-Reconcile_Title-")],
+    [sg.Text("Account: ", font=("",medium_print)), sg.Combo([], size=(42,1), readonly=True, key="-Reconcile_Account-"),
+     sg.Text("Statement date: ", font=("",medium_print)), sg.Input("", size=(11,1), key="-Reconcile_Date-"), sg.CalendarButton("Select Date", format="%Y-%m-%d", key="-Reconcile_Date_Cal-"),
+     sg.Text("Ending balance: $", font=("",medium_print)), sg.Input("", size=(14,1), key="-Reconcile_Balance-"),
+     sg.Button("Load Transactions", key="-Reconcile_Load-")],
+    [sg.Text("Click each transaction that appears on the statement to mark it cleared; click again to unmark. Unselected transactions are unmatched.", font=("",small_print))],
+    [sg.Listbox(values=[], select_mode=sg.LISTBOX_SELECT_MODE_MULTIPLE, size=(118,16), font=("Courier",medium_print), enable_events=True, background_color=detailed_information_color, key="-Reconcile_List-")],
+    [sg.Multiline("", size=(118,8), font=("Courier",medium_print), disabled=True, background_color=overview_information_color, key="-Reconcile_Summary-")],
+    [sg.Button("Finish Reconciliation", disabled=True, key="-Reconcile_Finish-"), sg.Button("Undo Last Reconciliation", key="-Reconcile_Undo-"), sg.Button("Reconciliation History", key="-Reconcile_History-")],
 ]
 
 
@@ -370,7 +396,7 @@ view_vendors_tab_column_1 = [
 ]
 
 view_vendors_tab_column_2 = [
-    [sg.Table(values=[],row_height=36, col_widths=[8,32,20,22,20], cols_justification=["c","c","c","c","c"], auto_size_columns=False, headings=["Vendor", "Name", "Contact", "Phone", "Email"], num_rows=16, expand_x=True, expand_y=True, font=("",medium_print), enable_events=True, justification="Center", key="-View_Vendors_Content-", background_color=detailed_information_color)],
+    [sg.Table(values=[], enable_click_events=True, alternating_row_color=THEME.color('table_alt'), text_color=THEME.color('table_text'), header_font=THEME.font('medium', bold=True),row_height=36, col_widths=[8,32,20,22,20], cols_justification=["c","c","c","c","c"], auto_size_columns=False, headings=["Vendor", "Name", "Contact", "Phone", "Email"], num_rows=16, expand_x=True, expand_y=True, font=("",medium_print), enable_events=True, justification="Center", key="-View_Vendors_Content-", background_color=detailed_information_color)],
 ]
 
 vendors_tab = [
@@ -420,7 +446,7 @@ view_customers_tab_column_1 = [
 ]
 
 view_customers_tab_column_2 = [
-    [sg.Table(values=[],row_height=36, col_widths=[10,24,20,14,20,14], cols_justification=["c","c","c","c","c","c"], auto_size_columns=False, headings=["Customer", "Name", "Contact", "Phone", "Email", "Balance"], num_rows=16, expand_x=True, expand_y=True, font=("",medium_print), enable_events=True, justification="Center", key="-View_Customers_Content-", background_color=detailed_information_color)],
+    [sg.Table(values=[], enable_click_events=True, alternating_row_color=THEME.color('table_alt'), text_color=THEME.color('table_text'), header_font=THEME.font('medium', bold=True),row_height=36, col_widths=[10,24,20,14,20,14], cols_justification=["c","c","c","c","c","c"], auto_size_columns=False, headings=["Customer", "Name", "Contact", "Phone", "Email", "Balance"], num_rows=16, expand_x=True, expand_y=True, font=("",medium_print), enable_events=True, justification="Center", key="-View_Customers_Content-", background_color=detailed_information_color)],
 ]
 
 customers_tab = [
@@ -462,7 +488,7 @@ view_services_tab_column_1 = [
 ]
 
 view_services_tab_column_2 = [
-    [sg.Table(values=[],row_height=36, col_widths=[12,48,20,20], cols_justification=["c","c","c","c"], auto_size_columns=False, headings=["SKU", "Description", "Price", "Taxable?"], num_rows=16, expand_x=True, expand_y=True, font=("",medium_print), enable_events=True, justification="Center", key="-View_Services_Content-", background_color=detailed_information_color)],
+    [sg.Table(values=[], enable_click_events=True, alternating_row_color=THEME.color('table_alt'), text_color=THEME.color('table_text'), header_font=THEME.font('medium', bold=True),row_height=36, col_widths=[12,48,20,20], cols_justification=["c","c","c","c"], auto_size_columns=False, headings=["SKU", "Description", "Price", "Taxable?"], num_rows=16, expand_x=True, expand_y=True, font=("",medium_print), enable_events=True, justification="Center", key="-View_Services_Content-", background_color=detailed_information_color)],
 ]
 
 services_tab = [
@@ -518,7 +544,9 @@ pos_tab_column_1 = [
 ]
 
 pos_tab_column_2 = [
-    [sg.Table(values=[],row_height=36, col_widths=[12,20,16,22,16,16], cols_justification=["c","c","c","c","c","c"], auto_size_columns=False, headings=["Invoice","Customer Name", "Phone", "Email", "Total", "Status"], num_rows=16, expand_x=True, expand_y=True, font=("",medium_print), enable_events=True, justification="Center", key="-View_POS_Content-", background_color=detailed_information_color)],
+    [sg.Table(values=[], enable_click_events=True, alternating_row_color=THEME.color('table_alt'), text_color=THEME.color('table_text'), header_font=THEME.font('medium', bold=True),row_height=36, col_widths=[12,20,16,22,16,16], cols_justification=["c","l","c","l","r","c"], auto_size_columns=False, headings=["Invoice","Customer Name", "Phone", "Email", "Total", "Status"], num_rows=9, expand_x=True, expand_y=True, font=("",medium_print), enable_events=True, justification="Center", key="-View_POS_Content-", background_color=detailed_information_color)],
+    [sg.Text("Invoice history (status changes, payments, refunds, and their ledger entries)", font=("",small_print), key="-POS_History_Title-")],
+    [sg.Table(values=[],row_height=28, col_widths=[26,18,16,12,26,10], cols_justification=["l","l","c","r","l","c"], auto_size_columns=False, headings=["When","Event", "Status", "Amount", "Account", "Ledger #"], num_rows=5, expand_x=True, expand_y=False, font=("",small_print), enable_events=False, justification="left", key="-POS_History_Content-", background_color=detailed_information_color)],
 ]
 
 POS_tab = [
@@ -570,7 +598,7 @@ view_account_frame_layout = [
     [sg.Column(layout=view_account_labels_layout, justification = "left", background_color=overview_information_color, size=(account_information_labels_width*7,view_account_column_height)), sg.Column(layout=view_account_edit_layout, justification = "left", background_color=overview_information_color, size=(account_information_labels_width*5,view_account_column_height) )],
     [sg.Text(f"Notes: ", font=("",small_print), size=(account_information_labels_width,1),justification="left", background_color=overview_information_color)],
     [sg.Multiline(f"Notes and notes and notes and notes and lorum ipsum lebold valco hebonable ens je patetin", font=("",medium_print), autoscroll=True, size=(account_information_labels_width*2,5),justification="left", background_color=detailed_information_color, key="-Account_Notes_Display-")],
-    [sg.Push(background_color=overview_information_color), sg.Button(f"Edit Account", disabled=True,  key="-Edit_Account_Button-")],
+    [sg.Push(background_color=overview_information_color), sg.Button("Reconcile", key="-Reconcile_Button-"), sg.Button(f"Edit Account", disabled=True,  key="-Edit_Account_Button-")],
 ]
 
 
@@ -579,7 +607,7 @@ view_account_tab_column_1 = [
     [sg.Frame("Account: ", layout=view_account_frame_layout, size=(275,455),font=("",medium_print,"bold"), key="-View_Account_Frame-", background_color=overview_information_color)],
 ]
 view_account_tab_column_2 = [
-    [sg.Table(values=[],row_height=36, col_widths=[10,10,40,14,14,14], cols_justification=["c","c","c","c","c","c"], auto_size_columns=False, headings=["Transaction", "Date", "Name", "Credits", "Debits", "Balance"], num_rows=12, expand_x=True, expand_y=True, font=("",medium_print), enable_events=True, justification="Center", key="-Account_Register_Content-", background_color=detailed_information_color)],
+    [sg.Table(values=[], enable_click_events=True, alternating_row_color=THEME.color('table_alt'), text_color=THEME.color('table_text'), header_font=THEME.font('medium', bold=True),row_height=36, col_widths=[10,10,40,14,14,14], cols_justification=["c","c","l","r","r","r"], auto_size_columns=False, headings=["Transaction", "Date", "Name", "Credits", "Debits", "Balance"], num_rows=12, expand_x=True, expand_y=True, font=("",medium_print), enable_events=True, justification="Center", key="-Account_Register_Content-", background_color=detailed_information_color)],
 ]
 
 
@@ -660,7 +688,7 @@ view_ledger_tab_column_1 = [
 ]
 view_ledger_tab_column_2 = [
     [sg.Text(f"Ledger: None", expand_x=True, font=("",medium_print), justification="center", key="-Ledger_Title_Display-")],
-    [sg.Table(values=[],row_height=36, col_widths=[7,50,12,10,10,10], cols_justification=["c","c","c","c","c","c"], auto_size_columns=False, header_font=("",small_print),headings=["Transaction", "Name", "Amount", "Debit Account", "Credit Account", "Date"], num_rows=18, expand_x=True, expand_y=True, font=("",medium_print), enable_events=True, key="-Ledger_Display_Content-", background_color=detailed_information_color)],
+    [sg.Table(values=[], enable_click_events=True, alternating_row_color=THEME.color('table_alt'), text_color=THEME.color('table_text'), header_font=THEME.font('medium', bold=True),row_height=36, col_widths=[7,50,12,10,10,10], cols_justification=["c","l","r","c","c","c"], auto_size_columns=False, headings=["Transaction", "Name", "Amount", "Debit Account", "Credit Account", "Date"], num_rows=18, expand_x=True, expand_y=True, font=("",medium_print), enable_events=True, key="-Ledger_Display_Content-", background_color=detailed_information_color)],
     [sg.Push(),sg.Combo(values=["All Years"], default_value="All Years", enable_events=True, key="-Ledger_Year_Picker-"), sg.Input("",(20,1),disabled=False, enable_events=True, key="-Ledger_Search_Input-"),sg.Button("New Transaction",enable_events=True, key="-New_Transaction_Button-"),sg.Text(" ")],
 
 ]
@@ -670,7 +698,7 @@ ledger_tab = [
 ]
 
 about_tab = [
-    [sg.Text(f"\n\nAbout Iceberg: \nVersion 1.1\n\nDeveloped in the United States by Joseph M. Basile \n\nMIT License 2024", expand_x=True, font=("",medium_print), justification="center")],
+    [sg.Text(f"\n\nAbout Iceberg: \nVersion 1.4\n\nTimestamps are stored in UTC and shown in your local time.\nBackups are written to the backups folder on every save.\nReports, reconciliation, invoice history, validation, and CSV import/export are described in the docs folder.\n\nDeveloped in the United States by Joseph M. Basile \n\nMIT License 2024", expand_x=True, font=("",medium_print), justification="center")],
 ]
 
 #-------------Overall Layout------------------------
@@ -680,6 +708,7 @@ current_time = get_current_time_info()
 
 layout1 = [
     [sg.Menu(menu_def, key="-Program_Menu-")],
+    navigation.build_nav_bar(sg, THEME),
     [sg.Text(f"""No Data Loaded""", key="-Load_Messages-", font=("",large_print), size=(20,1), justification="center", expand_x=True)],
 #    [sg.Column([[sg.Text("Year: ", font=("",medium_print)),sg.OptionMenu(values=[f"CY{current_year}"], auto_size_text=True, default_value=f"CY{current_year}",key="-Year_Picker-")]], justification="center", element_justification="center")],
     [sg.Text(current_time[0], key='-Current_Time_Display-', font=("",medium_print), size=(133,1), justification="center", visible=True, expand_x=True)],
@@ -696,12 +725,19 @@ layout1 = [
         [sg.Tab('Database Properties', layout=[[sg.Column(scrollable=False, vertical_scroll_only=True, expand_x=True, expand_y=True, pad=0, layout=view_properties_tab, size=(800,800))]], visible=False, pad=2, key='-View_Properties_Tab-')],#9   
         [sg.Tab('Services', layout=[[sg.Column(scrollable=False, vertical_scroll_only=True, expand_x=True, expand_y=True, pad=0, layout=services_tab, size=(800,800))]], visible=False, pad=2, key='-View_Services_Tab-')],#10   
         [sg.Tab('About', layout=[[sg.Column(scrollable=False, vertical_scroll_only=True, expand_x=True, expand_y=True, pad=0, layout=about_tab, size=(800,800))]], visible=False, pad=2, key='-About_Tab-')],#11  
+        [sg.Tab('Reconcile', layout=[[sg.Column(scrollable=False, vertical_scroll_only=True, expand_x=True, expand_y=True, pad=0, layout=reconcile_tab, size=(800,800))]], visible=False, pad=2, key='-Reconcile_Tab-')],#12
     ], expand_x=True, expand_y=True, key='-Display_Area-', size=(800,720))   ],
+    feedback.build_status_bar(sg, THEME),
     [sg.Column(console_frame_layout, size=(900,60), expand_x=True, key="-Console_Column-", scrollable=True, vertical_scroll_only=True)], #scrollable=False,
 ]
 
 
-tab_keys = ['-Dashboard_Tab-','-Ledger_Tab-','-Reports_Tab-','-Vendors_Tab-','-Customers_Tab-','-Invoicing_Tab-','-Inventory_Tab-','-Owner_Equity_Tab-','-View_Account_Tab-','-View_Properties_Tab-','-View_Services_Tab-', "-About_Tab-"]
+tab_keys = navigation.TAB_KEYS
+
+
+def show_tab(window, index):
+    """Make one tab visible and selected, hide the rest, and sync the navigation bar (ST-015)."""
+    navigation.show_tab(window, THEME, index)
 
 
 #░▒▓███████▓▒░   ░▒▓██████▓▒░  ░▒▓███████▓▒░  ░▒▓█▓▒░░▒▓█▓▒░ ░▒▓███████▓▒░   ░▒▓███████▓▒░ 
@@ -773,28 +809,46 @@ def new_transaction_layout(num):
         these_vendors.append("None")
 
 
+    # Grouped into sections with required fields marked (ST-019); validation
+    # messages appear next to the Submit button and invalid fields are coloured.
+    details_section = forms.section(sg, THEME, "Details", [
+        [forms.label(sg, THEME, "Transaction name", required=True), sg.Input(size=(28,1), key=f"-Transaction_Name_{num}-", font=THEME.font("medium"), focus=True, tooltip="What the transaction was for")],
+        [forms.label(sg, THEME, "Date", required=True), sg.Input("", size=(12,1), font=THEME.font("medium"), key=f"-Transaction_Date_String_{num}-", tooltip="YYYY-MM-DD"), sg.CalendarButton("Select Date", format="%Y-%m-%d", size=(12,1), key=f"-Transaction_Date_{num}-", enable_events=True)],
+        [forms.label(sg, THEME, "Amount", required=True), sg.Text("$", size=(1,1), font=THEME.font("medium")), sg.Input("", (16,1), key=f"-Transaction_Amount_{num}-", tooltip="Positive dollars, e.g. 125.00")],
+    ])
+    accounts_section = forms.section(sg, THEME, "Accounts", [
+        [forms.label(sg, THEME, "Debit (money goes to)", required=True), sg.OptionMenu(these_accounts, key=f"-Transaction_Debit_Account_{num}-")],
+        [forms.label(sg, THEME, "Credit (money comes from)", required=True), sg.OptionMenu(these_accounts, key=f"-Transaction_Credit_Account_{num}-")],
+        [forms.label(sg, THEME, "Vendor"), sg.OptionMenu(these_vendors, key=f"-Transaction_Vendor_{num}-")],
+    ])
+    notes_section = forms.section(sg, THEME, "Notes", [
+        [sg.Multiline("", font=THEME.font("medium"), size=(50,3), key=f"-Transaction_Notes_{num}-")],
+    ])
+    receipt_section = forms.section(sg, THEME, "Receipt (optional)", [
+        [sg.Image(logo, size=(300,300), enable_events=False, key=f"-Transaction_Image_Display_{num}-", subsample=3)],
+        [sg.FileBrowse("Select Image", enable_events=True, key=f"-Transaction_Image_Input_{num}-")],
+    ])
+
     new_transaction_column_1 = [
-        [sg.Image("checkbook_art_free.png",size=(50,50),subsample=1),sg.Text(f"Transaction {transaction_number_str}", size=(13,1), font=("Bold",large_print),justification="center", pad=(0,0), key=f"-Transaction_Title_{num}-")],
-        [sg.Text("Transaction Name*: ", font=("",medium_print)), sg.Push(), sg.Input(size=(20,1), key=f"-Transaction_Name_{num}-", font=("", medium_print) )],
-        [sg.Text("Transaction Date*: ", font=("",medium_print)), sg.Push(),sg.Input("",size=(12,1),font=("",medium_print), key=f"-Transaction_Date_String_{num}-"), sg.CalendarButton(f"Select Date",format= "%Y-%m-%d", size=(16,1),key=f"-Transaction_Date_{num}-", enable_events=True)],
-        [sg.Text("Amount*: ", font=("",medium_print)), sg.Push(), sg.Text("$",size=(1,1),font=("",medium_print)), sg.Input("",(16,1),key=f"-Transaction_Amount_{num}-")],
-        [sg.Text("Debit Account*: ", font=("",medium_print)), sg.Push(), sg.OptionMenu(these_accounts,key=f"-Transaction_Debit_Account_{num}-")],
-        [sg.Text("Credit Account*: ", font=("",medium_print)), sg.Push(), sg.OptionMenu(these_accounts,key=f"-Transaction_Credit_Account_{num}-")],
-        [sg.Text("Vendor: ", font=("",medium_print)), sg.Push(), sg.OptionMenu(these_vendors,key=f"-Transaction_Vendor_{num}-")],
-        #[sg.Text("Customer: ", font=("",medium_print)), sg.Push(), sg.OptionMenu(["","Pauli Portabello","Sally Swiss Chard","Officer Acorn Squash"],key=f"-Transaction_Customer_{num}-")],
-        [sg.Push(), sg.Multiline("Notes: ", font=("",medium_print), size=(44,4),key=f"-Transaction_Notes_{num}-")],
+        [sg.Image("checkbook_art_free.png", size=(50,50), subsample=1), sg.Text(f"Transaction {transaction_number_str}", font=THEME.font("large", bold=True), key=f"-Transaction_Title_{num}-"), sg.Push(), forms.legend(sg, THEME)],
+        [details_section],
+        [accounts_section],
+        [notes_section],
     ]
-    
-    new_transaction_column_2 = [
-        [sg.Column(layout=[[sg.Image(logo,size=(350,360), enable_events=False, key=f"-Transaction_Image_Display_{num}-", subsample=3)],[sg.FileBrowse("Select Image",enable_events=True, key=f"-Transaction_Image_Input_{num}-")]],size=(350,400),element_justification="center",justification="center")],
-    ]
+    new_transaction_column_2 = [[receipt_section]]
 
     new_transaction_layout = [
-        [sg.Column(layout=new_transaction_column_1,pad=0),sg.Column(new_transaction_column_2,pad=0)],
-        [sg.Column([[sg.Button(button_text="Submit",size=(20,1),key=f'-Submit_Transaction_Button_{num}-', enable_events=True)],[sg.Sizer(780,0)]],justification="center", size=(780,60),element_justification="center",expand_x=True)],
+        [sg.Column(layout=new_transaction_column_1, pad=0, expand_x=True), sg.Column(new_transaction_column_2, pad=0, vertical_alignment="top")],
+        forms.message_row(sg, THEME, f"-Transaction_Message_{num}-"),
+        [sg.Push(), sg.Button(button_text="Submit", size=(20,1), key=f'-Submit_Transaction_Button_{num}-', enable_events=True, bind_return_key=True), sg.Push()],
     ]
     
     return new_transaction_layout, num
+
+
+def transaction_field_map(num):
+    """Validation field names -> element keys for the New Transaction form."""
+    return {"name": f"-Transaction_Name_{num}-", "date": f"-Transaction_Date_String_{num}-", "amount": f"-Transaction_Amount_{num}-"}
 
 
 def new_account_layout(num):
@@ -805,7 +859,7 @@ def new_account_layout(num):
 
     new_account_column = [
         [sg.Image("checkbook_art_free.png",size=(50,50),subsample=1),sg.Text(f"New Account", size=(13,1), font=("Bold",large_print),justification="center", key=f"-Account_Title_{num}-")],
-        [sg.Text("Account Name*: ", font=("",medium_print)), sg.Push(), sg.Input(size=(20,1), key=f"-Account_Name_{num}-", font=("", medium_print) )],
+        [sg.Text("Account Name *: ", font=THEME.font("medium", bold=True)), sg.Push(), sg.Input(size=(20,1), key=f"-Account_Name_{num}-", font=("", medium_print), focus=True)],
         [sg.Text("Account Type*: ", font=("",medium_print)), sg.Push(), sg.Push(), sg.OptionMenu(values=["10 Assets","11 Expenses", "12 Withdrawals", "13 Liabilities", "14 Owner Equity", "15 Revenue"], auto_size_text=True, default_value="10 Assets",key=f"-Account_Type_Picker_{num}-")],
         [sg.Text("Bank: ", font=("",medium_print)), sg.Push(), sg.Input("",(16,1),key=f"-Account_Bank_{num}-")],
         [sg.Text("Bank Account Type: ", font=("",medium_print)), sg.Push(), sg.Input("",key=f"-Account_Bank_Account_Type_{num}-", size=(16,1), enable_events=False)],
@@ -816,7 +870,8 @@ def new_account_layout(num):
     
     new_account_layout = [
         [sg.Column(layout=new_account_column,pad=0)],
-        [sg.Column([[sg.Button(button_text="Submit",size=(20,1),key=f'-Submit_Account_Button_{num}-', enable_events=True)],[sg.Sizer(480,0)]],justification="center", size=(480,60),element_justification="center",expand_x=True)],
+        forms.message_row(sg, THEME, f"-Account_Message_{num}-"),
+        [sg.Column([[sg.Button(button_text="Submit",size=(20,1),key=f'-Submit_Account_Button_{num}-', enable_events=True, bind_return_key=True)],[sg.Sizer(480,0)]],justification="center", size=(480,60),element_justification="center",expand_x=True)],
     ]
     
     return new_account_layout, num
@@ -908,8 +963,8 @@ def remove_account_in_use(window, values, event):
 def new_vendor_layout(num,vendor_number):
     num = num + 1
     new_vendor_layout = [
-        [sg.Text(f"Vendor Number: {vendor_number}", font=("",medium_print),expand_x=True, justification="center")],
-        [sg.Text("Business Name*: ", font=("",medium_print)), sg.Push(), sg.Input("",(30,1),key=f"-Vendor_Name_{num}-",)],
+        [sg.Text(f"Vendor Number: {vendor_number}", font=("",medium_print),expand_x=True, justification="center"), forms.legend(sg, THEME)],
+        [sg.Text("Business Name *: ", font=THEME.font("medium", bold=True)), sg.Push(), sg.Input("",(30,1),key=f"-Vendor_Name_{num}-", focus=True)],
         [sg.Text("Merchant Category: ", font=("",medium_print)), sg.Push(), sg.Input("",(30,1),key=f"-Vendor_Category_{num}-",)],
         [sg.Text("Contact First Name: ", font=("",medium_print)), sg.Push(), sg.Input(key=f"-Vendor_Contact_First_{num}-", size=(30,1))],
         [sg.Text("Contact Last Name: ", font=("",medium_print)), sg.Push(), sg.Input(key=f"-Vendor_Contact_Last_{num}-", size=(30,1))],
@@ -919,7 +974,8 @@ def new_vendor_layout(num,vendor_number):
         [sg.Text("Email: ", font=("",medium_print)), sg.Push(), sg.Input(key=f"-Vendor_Email_{num}-", size=(30,1))],
         [sg.Text("Website: ", font=("",medium_print)), sg.Push(), sg.Input(key=f"-Vendor_Website_{num}-", size=(30,1))],
         [sg.Multiline("Notes: ", font=("",medium_print), size=(62,4),key=f"-Vendor_Notes_{num}-",)],
-        [sg.Column([[sg.Button(button_text="Add Vendor",size=(20,1),key=f'-Submit_Vendor_Button_{num}-', enable_events=True)],[sg.Sizer(460,60)]],justification="center", size=(480,60),element_justification="center",expand_x=True)],
+        forms.message_row(sg, THEME, f"-Vendor_Message_{num}-"),
+        [sg.Column([[sg.Button(button_text="Add Vendor",size=(20,1),key=f'-Submit_Vendor_Button_{num}-', enable_events=True, bind_return_key=True)],[sg.Sizer(460,60)]],justification="center", size=(480,60),element_justification="center",expand_x=True)],
 
     ]
     
@@ -929,16 +985,17 @@ def new_vendor_layout(num,vendor_number):
 def new_customer_layout(num,customer_number):
     num = num + 1
     new_customer_layout = [
-        [sg.Text(f"Customer Number: {customer_number}", font=("",medium_print),expand_x=True, justification="center")],
-        [sg.Text("Business Name: ", font=("",medium_print)), sg.Push(), sg.Input("",(30,1),key=f"-Customer_Name_{num}-",)],
+        [sg.Text(f"Customer Number: {customer_number}", font=("",medium_print),expand_x=True, justification="center"), forms.legend(sg, THEME)],
+        [sg.Text("Business Name: ", font=("",medium_print)), sg.Push(), sg.Input("",(30,1),key=f"-Customer_Name_{num}-", focus=True)],
         [sg.Text("Contact First Name: ", font=("",medium_print)), sg.Push(), sg.Input(key=f"-Customer_Contact_First_{num}-", size=(30,1))],
         [sg.Text("Contact Last Name: ", font=("",medium_print)), sg.Push(), sg.Input(key=f"-Customer_Contact_Last_{num}-", size=(30,1))],
         [sg.Text("Contact Preferred Name: ", font=("",medium_print)), sg.Push(), sg.Input(key=f"-Customer_Contact_Preferred_{num}-", size=(30,1))],
         [sg.Text("Phone:", font=("",medium_print)), sg.Push(), sg.Input(key=f"-Customer_Phone_{num}-", size=(17,1)), sg.OptionMenu(phone_types,"Mobile",key=f"-Customer_Phone_Type_{num}-")],
-        [sg.Text("Address*: ", font=("",medium_print)), sg.Push(), sg.Multiline(key=f"-Customer_Address_{num}-", size=(28,2))],
+        [sg.Text("Address *: ", font=THEME.font("medium", bold=True)), sg.Push(), sg.Multiline(key=f"-Customer_Address_{num}-", size=(28,2))],
         [sg.Text("Email: ", font=("",medium_print)), sg.Push(), sg.Input(key=f"-Customer_Email_{num}-", size=(30,1))],
         [sg.Multiline("Notes: ", font=("",medium_print), size=(62,4),key=f"-Customer_Notes_{num}-",)],
-        [sg.Column([[sg.Button(button_text="Add Customer",size=(20,1),key=f'-Submit_Customer_Button_{num}-', enable_events=True)],[sg.Sizer(460,60)]],justification="center", size=(480,60),element_justification="center",expand_x=True)],
+        forms.message_row(sg, THEME, f"-Customer_Message_{num}-"),
+        [sg.Column([[sg.Button(button_text="Add Customer",size=(20,1),key=f'-Submit_Customer_Button_{num}-', enable_events=True, bind_return_key=True)],[sg.Sizer(460,60)]],justification="center", size=(480,60),element_justification="center",expand_x=True)],
 
     ]
     
@@ -947,12 +1004,13 @@ def new_customer_layout(num,customer_number):
 def new_service_layout(num,service_number):
     num = num + 1
     new_service_layout = [
-        [sg.Text(f"Service Number: {service_number}", font=("",medium_print),expand_x=True, justification="center")],
-        [sg.Text("Description*: ", font=("",medium_print)), sg.Push(), sg.Input("",(30,1),key=f"-Service_Description_{num}-",)],
-        [sg.Text("Price*: ", font=("",medium_print)), sg.Push(), sg.Input(key=f"-Service_Price_{num}-", size=(30,1))],
-        [sg.Text("Taxable*: ", font=("",medium_print)), sg.Push(), sg.Combo(("True","False"),"False", key=f"-Service_Taxable_{num}-", size=(30,1))],
+        [sg.Text(f"Service Number: {service_number}", font=("",medium_print),expand_x=True, justification="center"), forms.legend(sg, THEME)],
+        [sg.Text("Description *: ", font=THEME.font("medium", bold=True)), sg.Push(), sg.Input("",(30,1),key=f"-Service_Description_{num}-", focus=True)],
+        [sg.Text("Price *: ", font=THEME.font("medium", bold=True)), sg.Push(), sg.Input(key=f"-Service_Price_{num}-", size=(30,1), tooltip="Dollars, e.g. 150.00")],
+        [sg.Text("Taxable *: ", font=THEME.font("medium", bold=True)), sg.Push(), sg.Combo(("True","False"),"False", key=f"-Service_Taxable_{num}-", size=(30,1), readonly=True)],
         [sg.Multiline("", font=("",medium_print), size=(62,4),key=f"-Service_Long_Description_{num}-",)],
-        [sg.Column([[sg.Button(button_text="Add Service",size=(20,1),key=f'-Submit_Service_Button_{num}-', enable_events=True)],[sg.Sizer(460,60)]],justification="center", size=(480,60),element_justification="center",expand_x=True)],
+        forms.message_row(sg, THEME, f"-Service_Message_{num}-"),
+        [sg.Column([[sg.Button(button_text="Add Service",size=(20,1),key=f'-Submit_Service_Button_{num}-', enable_events=True, bind_return_key=True)],[sg.Sizer(460,60)]],justification="center", size=(480,60),element_justification="center",expand_x=True)],
 
     ]
     
@@ -979,27 +1037,9 @@ def new_service_layout(num,service_number):
 
 
 
-def synchronize_time(window, current_time_display):
-    f"""Updates the time the first time after the program is opened. Returns Yes or No on whether the time updates are sychronized with the system time."""
-    current_time = get_current_time_info()
-    #print(values)
-    if current_time_display[0] == current_time[0]:
-        #print("Not Synchronized")
-        return "No", current_time
-    else:
-        #print((current_time_display[0]))
-        #print((current_time[0]))
-        return "Yes", current_time
-
-
-def update_time(window):
-    f"""Updates the time at the top of the program."""
-    current_time = get_current_time_info()
-    window['-Current_Time_Display-'].update(current_time[0])
-    return current_time
-
 def create_database(values, current_console_messages,window, num, current_year):
     """Adds a new accounting database with the name given by the registering user."""
+    timestamp = iceberg_time.storage_timestamp()
 
     
 
@@ -1014,160 +1054,39 @@ def create_database(values, current_console_messages,window, num, current_year):
     icb_session.db_name = db_name_2 + f""".icb"""
     path_exists = os.path.exists(f"./{icb_session.db_name}")
     if path_exists==True:
-        icb_session.console_log("DATABASE ALREADY EXISTS",icb_session.current_console_messages)
+        icb_session.current_console_messages = icb_session.console_log(f"Database not created: {icb_session.db_name} already exists in the Iceberg folder.",icb_session.current_console_messages)
+        sg.popup_error(f"A database named {icb_session.db_name} already exists in the Iceberg folder.\n\nOpen it with File > Open Database, or choose a different business name.", title="Iceberg - database exists")
         return False, False, False
-    #print(icb_session.db_name)
+    try:
+        return build_new_database(values, num, timestamp)
+    except Exception as error:
+        # Never leave a half-built, unencrypted database behind.
+        try:
+            if icb_session.connection:
+                icb_session.connection.close()
+        except Exception:
+            pass
+        icb_session.connection = False
+        icb_session.database_loaded = False
+        if os.path.exists(f"./{icb_session.db_name}"):
+            os.remove(f"./{icb_session.db_name}")
+        icb_session.current_console_messages = icb_session.console_log(f"Database not created: {error}", icb_session.current_console_messages)
+        sg.popup_error(f"The database could not be created and the partial file was removed.\n\n{error}", title="Iceberg - new database failed")
+        return False, False, False
+
+
+def build_new_database(values, num, timestamp):
+    """Create the tables, default accounts, and properties for a new database."""
     if icb_session.connection == False:
         icb_session.connection = db.create_connection(f"./{icb_session.db_name}")
         #print(f"460 connection: {icb_session.connection}; {icb_session.db_name}")
     year = datetime.datetime.now().year
 
 
-   #7 Create the Console_Log Table
-    create_table_6_query = f"""CREATE TABLE tbl_Console_Log (Log_ID INTEGER NOT NULL"""
-    
-    lines = [   """, Console_Messages VARCHAR(9999) NOT NULL""", 
-                """, Created_Time VARCHAR(9999) NOT NULL""", 
-                """, Edited_Time VARCHAR(9999) NOT NULL""" ,
-                """, PRIMARY KEY ("Log_ID" AUTOINCREMENT)"""
-            ]
-    num_lines = len(lines)
-    for p in range(num_lines):
-        create_table_6_query = create_table_6_query + lines[p]
-    create_table_6_query = create_table_6_query + """);"""
-
-
-    created_table = db.create_tables(icb_session.connection,create_table_6_query)
-    print(f"{created_table}: tbl_Console_Log")
-
-
-    #1 Create the Ledger
-
-    ledger_name_1 = f"""ledger_{icb_session.db_name[:-4]}"""
-    icb_session.ledger_name = f"""tbl_{ledger_name_1}_CY{year}"""
-
-
-    create_table_1_query = f"""CREATE TABLE {icb_session.ledger_name} (Transaction_ID INTEGER NOT NULL"""
-    lines = [""", Credit_Acct CHAR(5) NOT NULL""",
-                """, Debit_Acct CHAR(5) NOT NULL""",
-                """, Amount INTEGER NOT NULL""",
-                """, Name VARCHAR(9999) NOT NULL""",
-                """, Notes VARCHAR(9999)""",
-                """, Created_Time VARCHAR(9999) NOT NULL""", 
-                """, Edited_Time VARCHAR(9999) NOT NULL""" ,
-                """, Transaction_Date DATE NOT NULL""" ,
-                """, Record_Image VARCHAR(9999) NOT NULL""" ,
-                """, Vendor VARCHAR(9999)""",
-                """, Customer VARCHAR(9999)""",
-                """, PRIMARY KEY ("Transaction_ID" AUTOINCREMENT)""",
-                """, CONSTRAINT chk CHECK (Amount>0)"""
-            ]
-    num_lines = len(lines)
-    for p in range(num_lines):
-        create_table_1_query = create_table_1_query + lines[p]
-    create_table_1_query = create_table_1_query + """);"""
-
-    created_table = db.create_tables(icb_session.connection,create_table_1_query)
-    #print(f"creating ledger: {create_table_1_query}")
-    print(created_table)
-
-    #2 Create the table of accounts and populate it with default accounts
-
-    account_repo = AccountRepository(icb_session.connection)
-    created_table = account_repo.create_table()
-    print(created_table)
-
-    #TODO:ADD IN DEFAULT ACCOUNTS
-
-
-    default_accounts = [
-        [10001,"Fixed Asset Real Estate","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [10002,"Fixed Asset Bank Account Checking","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [10003,"Misc Property","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [10004,"Cash","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [10005,"Product Inventory","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [10006,"Accounts Receivable","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11001,"Office Supplies and Postage","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11002,"Advertising","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11003,"Commissions and Fees","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11004,"Contract Labor","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11005,"Asset Depreciations","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11006,"Insurance","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11007,"Mortgage Interest","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11008,"Legal and Professional Services","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11009,"Rent or Lease of Personal Property","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11010,"Rent or Lease of Real Property","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11011,"Repairs and Maintenance","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11012,"Supplies Expense - Non-Inventory","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11013,"Taxes and Licenses","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11014,"Business Travel Expenses","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11015,"Business Deductible Meals","Notes:  SEE IRS INSTRUCTIONS",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11016,"Utilties","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11017,"Other Expenses","Notes: SEE IRS INSTRUCTIONS",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [11018,"Cost of Goods Sold","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [12001,"Owner Equity Withdrawals","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [12002,"Owner Equity: Unclaimable Expenses","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [12003,"Owner Equity: Ask Accountant","Notes: Accountant or tax professional to review for claimable expenses.",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [13001,"Liabilities","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [13002,"Accounts Payable","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [13003,"Sales Tax Payable","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [14001,"Owner Equity Deposits","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [15001,"Sales","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [15002,"Real Estate Equity","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-        [15003,"Other Revenue","Notes:",icb_session.current_time_display[0],icb_session.current_time_display[0],"","","",""],
-    ]
-
-    for account in default_accounts:
-        created_account = account_repo.insert(
-            account[0],
-            account[1],
-            account[2],
-            account[3],
-            account[4],
-            account[5],
-            account[6],
-            account[7],
-            account[8]
-        )
-        current_console_messages = icb_session.console_log(message=created_account,current_console_messages=current_console_messages)
-        print(created_account)
-
-
-    #3 Create the Owners table
-
-    owner_repo = OwnerRepository(icb_session.connection)
-    created_table = owner_repo.create_table()
-
-
-    #TODO: Collect user information during setup
-
-    #4 Create the Vendors Table
-    #4 Create the Vendors Table
-    vendor_repo = VendorRepository(icb_session.connection)
-    created_table = vendor_repo.create_table()
-    icb_session.vendor_number = int(0)
-    print(created_table)
-
-    #5 Create the Customers Table
-    customer_repo = CustomerRepository(icb_session.connection)
-    created_table = customer_repo.create_table()
-    print(created_table)
-
-    #6 Create the Invoices Table
-    invoice_repo = InvoiceRepository(icb_session.connection)
-    created_table = invoice_repo.create_table()
-    #print("Invoices_Table")
-    print(created_table)
-
-
-
-    #8 Create the Properties Table
-    property_repo = PropertyRepository(icb_session.connection)
-    created_table = property_repo.create_table()
-    print(created_table)
-
-    #Create the properties
-    current_year
+    # Schema, default chart of accounts, and properties come from books.py so the
+    # classic and web interfaces create identical databases.
+    icb_session.ledger_name = books.ledger_table_name(icb_session.db_name, year)
+    books.create_schema(icb_session.connection, icb_session.ledger_name, timestamp)
     icb_session.business_name = values[f'-db_name_{num}-']
     icb_session.business_address = values[f'-Business_Address_{num}-']
     icb_session.owner_name = values[f'-Business_Officer_{num}-']
@@ -1176,33 +1095,16 @@ def create_database(values, current_console_messages,window, num, current_year):
     icb_session.owner_email = values[f'-Business_Email_{num}-']
     icb_session.owner_notes = values[f'-Business_Notes_{num}-']
     icb_session.business_ein = values[f'-Business_EIN_{num}-']
-    icb_session.sales_tax = dec(values[f'-Business_SalesTax_{num}-'])/100
-    
+    icb_session.sales_tax = validation.parse_percent(values[f'-Business_SalesTax_{num}-'])
     icb_session.receipts_location = values[f'-Business_Receipts_Repository_{num}-']
-
-    property_repo.insert("Business Name", icb_session.business_name, "", icb_session.current_time_display[0], icb_session.current_time_display[0])
-    property_repo.insert("Address", icb_session.business_address, "", icb_session.current_time_display[0], icb_session.current_time_display[0])
-    property_repo.insert("Owner or Financial Officer Name", icb_session.owner_name, "", icb_session.current_time_display[0], icb_session.current_time_display[0])
-    property_repo.insert("Title or Position", icb_session.owner_title, "", icb_session.current_time_display[0], icb_session.current_time_display[0])
-    property_repo.insert("Phone Number", icb_session.owner_phone, "", icb_session.current_time_display[0], icb_session.current_time_display[0])
-    property_repo.insert("Email", icb_session.owner_email, "", icb_session.current_time_display[0], icb_session.current_time_display[0])
-    property_repo.insert("Notes", icb_session.owner_notes, "", icb_session.current_time_display[0], icb_session.current_time_display[0])
-    property_repo.insert("EIN or SSN", icb_session.business_ein, "", icb_session.current_time_display[0], icb_session.current_time_display[0])
-    property_repo.insert("Receipts Repository Location", icb_session.receipts_location, "", icb_session.current_time_display[0], icb_session.current_time_display[0])
-    property_repo.insert("Ledger Name", icb_session.ledger_name, "", icb_session.current_time_display[0], icb_session.current_time_display[0])
-    property_repo.insert("Sales Tax", icb_session.sales_tax, "", icb_session.current_time_display[0], icb_session.current_time_display[0])
-
-    icb_session.current_console_messages = icb_session.console_log(message=f"Saved database properties for {icb_session.business_name}. Owner: {icb_session.owner_name}",current_console_messages=icb_session.current_console_messages)
-
-
-    #9 Create the SKU Table
-    sku_repo = SkuRepository(icb_session.connection)
-    created_table = sku_repo.create_table()
-    #print("SKU_Table")
-    print(created_table)
-
-
-
+    books.write_properties(icb_session.connection, icb_session.ledger_name, {
+        "business_name": icb_session.business_name, "address": icb_session.business_address,
+        "owner_name": icb_session.owner_name, "owner_title": icb_session.owner_title, "phone": icb_session.owner_phone,
+        "email": icb_session.owner_email, "notes": icb_session.owner_notes, "ein": icb_session.business_ein,
+        "receipts_location": icb_session.receipts_location, "sales_tax": icb_session.sales_tax,
+    }, timestamp)
+    icb_session.vendor_number = int(0)
+    icb_session.current_console_messages = icb_session.console_log(message=f"Created {len(books.DEFAULT_ACCOUNTS)} default accounts and saved database properties for {icb_session.business_name}.", current_console_messages=icb_session.current_console_messages)
 
     #Condition Save Location
     icb_session.database_loaded = True
@@ -1217,13 +1119,20 @@ def create_database(values, current_console_messages,window, num, current_year):
     else:
         icb_session.save_location = values[f'-Save_Location_{num}-']
 
-    #Load to memory
-    icb_session.connection = db.load_db_to_memory(icb_session.connection)
+    #Load to memory and release the on-disk file so it can be encrypted/replaced (required on Windows)
+    disk_connection = icb_session.connection
+    icb_session.connection = db.load_db_to_memory(disk_connection)
+    disk_connection.close()
     print(f"connection: {icb_session.connection}")
 
     #Update the dashboard
     window, chart_of_accounts_display_content = update_dashboard_statistics(icb_session.window, values)
     
+    prepare_schema(icb_session)
+    icb_session.reset_change_tracking()
+    navigation.set_enabled(icb_session.window, True)
+    feedback.notify(icb_session.window, THEME, f"Created {icb_session.db_name}. Remember where the filekey was saved.", "success")
+
     #encrypt the database during the session
     icb_session.filekey, icb_session.filename, icb_session.save_location = db.encrypt_database(icb_session.db_name,"encrypt",False, icb_session.save_location, False)
 
@@ -1233,13 +1142,7 @@ def create_database(values, current_console_messages,window, num, current_year):
 def update_dashboard_statistics(window, values):
     #this_year = f"tbl_ledger_{icb_session.db_name[:-4]}_{values['-Year_Picker-']}" #Comment out the year picker
     #Bring the user to the dashboard
-    this_tab_index = 0
-    for i in range(len(tab_keys)):
-        if i == this_tab_index:
-            window[tab_keys[i]].update(visible=True)
-            window[tab_keys[i]].select()
-        else:
-            window[tab_keys[i]].update(visible=False)
+    show_tab(window, 0)
     #Set the time range (default = current YTD)
     #current_year = datetime.datetime.now().year
     #start_date = f"{(icb_session.current_year)}-01-01"
@@ -1484,6 +1387,7 @@ def load_view_account_tab(window, values, account_number, ledger_name):
     window['-Edit_Account_Credits-'].update(f"{this_account_credits_formattted}")
     window['-Edit_Account_Balance-'].update(f"{this_account_balance_formattted}")
     window['-Account_Notes_Display-'].update(this_account['Notes'])
+    TABLE_SORTER.register("-Account_Register_Content-", display_transactions)
     window['-Account_Register_Content-'].update(display_transactions)
     return window, values
 
@@ -1492,14 +1396,14 @@ def load_view_account_tab(window, values, account_number, ledger_name):
 def save_account_changes(window, values):
     """Saves account changes to the database."""
 
-    current_time = get_current_time_info()
+    timestamp = iceberg_time.storage_timestamp()
 
     repo = AccountRepository(icb_session.connection)
     updated_account = repo.update(
         values['-Edit_Account_Number_Input-'],
         values['-Edit_Account_Name_Input-'],
         values['-Account_Notes_Display-'],
-        current_time[1],
+        timestamp,
         values['-Edit_Account_Bank-'],
         values['-Edit_Account_Bank_Acct_Type-'],
         values['-Edit_Account_Bank_Acct_Routing-'],
@@ -1509,7 +1413,7 @@ def save_account_changes(window, values):
     
 def add_vendor_to_database(window,values):
     """Adds a vendor to the database based on the form input."""
-    current_time = get_current_time_info()
+    timestamp = iceberg_time.storage_timestamp()
     add_vendor_number = icb_session.vendor_number
     add_vendor_name = values[f"""-Vendor_Name_{icb_session.num}-"""]
     add_vendor_category = values[f"""-Vendor_Category_{icb_session.num}-"""]
@@ -1524,9 +1428,10 @@ def add_vendor_to_database(window,values):
     add_vendor_notes = values[f"""-Vendor_Notes_{icb_session.num}-"""]
 
     vendor_repo = VendorRepository(icb_session.connection)
-    added_vendor = vendor_repo.insert(add_vendor_number, add_vendor_name, add_vendor_category, add_vendor_contact_first, add_vendor_contact_last, add_vendor_contact_preferrred, add_vendor_phone, add_vendor_phone_type, current_time[1], current_time[1], add_vendor_address, add_vendor_email, add_vendor_website, add_vendor_notes)
+    added_vendor = vendor_repo.insert(add_vendor_number, add_vendor_name, add_vendor_category, add_vendor_contact_first, add_vendor_contact_last, add_vendor_contact_preferrred, add_vendor_phone, add_vendor_phone_type, timestamp, timestamp, add_vendor_address, add_vendor_email, add_vendor_website, add_vendor_notes)
 
     icb_session.current_console_messages = icb_session.console_log(f"Added Vendor {add_vendor_number}: {added_vendor}",icb_session.current_console_messages)
+    feedback.notify(icb_session.window, THEME, f"Vendor {add_vendor_number} '{add_vendor_name}' added.", "success" if added_vendor == "Query executed successfully" else "error")
 
 def load_single_vendor(window,values, vendor):
     vendor_repo = VendorRepository(icb_session.connection)
@@ -1575,6 +1480,7 @@ def load_vendors_tab(window,values):
         for vendor in retrieved_vendors:
             icb_session.vendors.append([f"{vendor['Vendor_ID']}",f"{vendor['Business_Name']}",f"{vendor['Contact_First_Name']} {vendor['Contact_Last_Name']}",f"{vendor['Phone_Number']} ({vendor['Phone_Number_Type']})",f"{vendor['Business_Email']}"])
         
+    TABLE_SORTER.register("-View_Vendors_Content-", icb_session.vendors)
     window["-View_Vendors_Content-"].update(icb_session.vendors)
 
 
@@ -1591,7 +1497,7 @@ def get_customer(window, values, customer_id):
 
 def add_customer_to_database(window,values):
     """Adds a customer to the database based on the form input."""
-    current_time = get_current_time_info()
+    timestamp = iceberg_time.storage_timestamp()
     add_customer_number = icb_session.customer_number
     add_customer_company_name = values[f"""-Customer_Name_{icb_session.num}-"""]
     add_customer_contact_first = values[f"""-Customer_Contact_First_{icb_session.num}-"""]
@@ -1612,14 +1518,15 @@ def add_customer_to_database(window,values):
         preferred_name=add_customer_contact_preferrred,
         phone=add_customer_phone,
         phone_type=add_customer_phone_type,
-        created_time=current_time[1],
-        edited_time=current_time[1],
+        created_time=timestamp,
+        edited_time=timestamp,
         address=add_customer_address,
         email=add_customer_email,
         notes=add_customer_notes
     )
 
     icb_session.current_console_messages = icb_session.console_log(f"Added Customer {add_customer_number}: {added_customer}",icb_session.current_console_messages)
+    feedback.notify(icb_session.window, THEME, f"Customer {add_customer_number} added.", "success" if added_customer == "Query executed successfully" else "error")
 
 
 def update_customers_view(window, values):
@@ -1638,6 +1545,7 @@ def update_customers_view(window, values):
                 total = int(invoice['Total'])
                 balance = balance + total
             icb_session.customers.append([f"{customer['Customer_ID']}",f"{customer['Customer_Company_Name']}",f"{customer['Customer_First_Name']} {customer['Customer_Last_Name']}",f"{customer['Customer_Phone_Number']}",f"{customer['Customer_Email']}", f"{format_currency(balance)}"])
+        TABLE_SORTER.register("-View_Customers_Content-", icb_session.customers)
         icb_session.window["-View_Customers_Content-"].update(icb_session.customers)
         window['-Customer_Name_Input-'].update("")
         window['-Customer_Contact_First_Input-'].update("")
@@ -1725,6 +1633,7 @@ def load_ledger_tab(window, values):
                 customer_name = f"{retrieved_customer['Customer_First_Name']} {retrieved_customer['Customer_Last_Name']} ({retrieved_customer['Preferred_Name']})"
             
             icb_session.transactions.append([f"{transaction['Transaction_ID']}",f"{transaction['Name']}",f"{format_currency(int(transaction['Amount']))}",f"{transaction['Debit_Acct']}",f"{transaction['Credit_Acct']}", f"{transaction['Transaction_Date']}"])
+        TABLE_SORTER.register("-Ledger_Display_Content-", icb_session.transactions, headings=["Transaction", "Name", "Amount", "Debit Account", "Credit Account", "Date"])
         icb_session.window["-Ledger_Display_Content-"].update(icb_session.transactions)
         icb_session.window['-Ledger_Title_Display-'].update(icb_session.ledger_name)
     
@@ -1779,6 +1688,7 @@ def search_ledger(window,values):
                 customer_name = f"{retrieved_customer['Customer_First_Name']} {retrieved_customer['Customer_Last_Name']} ({retrieved_customer['Preferred_Name']})"
             
             icb_session.transactions.append([f"{transaction['Transaction_ID']}",f"{transaction['Name']}",f"{format_currency(int(transaction['Amount']))}",f"{transaction['Debit_Acct']}",f"{transaction['Credit_Acct']}", f"{transaction['Transaction_Date']}"])
+        TABLE_SORTER.register("-Ledger_Display_Content-", icb_session.transactions, headings=["Transaction", "Name", "Amount", "Debit Account", "Credit Account", "Date"])
         icb_session.window["-Ledger_Display_Content-"].update(icb_session.transactions)
         icb_session.window['-Ledger_Title_Display-'].update(icb_session.ledger_name)
     
@@ -1808,12 +1718,11 @@ def load_transaction_details(transaction_number):
     icb_session.window['-Transaction_Number_Display-'].update(f"Transaction {transaction[0]['Transaction_ID']}")
     icb_session.window['-Ledger_Name_Input-'].update(f"{transaction[0]['Name']}")
     icb_session.window['-Ledger_Date_Input-'].update(f"{transaction[0]['Transaction_Date']}")
-    icb_session.window['-Ledger_Recorded_Input-'].update(f"{transaction[0]['Created_Time']}")
-    icb_session.window['-Ledger_Edited_Input-'].update(f"{transaction[0]['Edited_Time']}")
+    icb_session.window['-Ledger_Recorded_Input-'].update(iceberg_time.display_timestamp(transaction[0]['Created_Time']))
+    icb_session.window['-Ledger_Edited_Input-'].update(iceberg_time.display_timestamp(transaction[0]['Edited_Time']))
     icb_session.window['-Ledger_Amount_Input-'].update(f"{format_currency(transaction[0]['Amount'])}")
     icb_session.window['-Ledger_Credit_Input-'].update(f"{transaction[0]['Credit_Acct']}")
     icb_session.window['-Ledger_Debit_Input-'].update(f"{transaction[0]['Debit_Acct']}")
-    icb_session.window['-Ledger_Recorded_Input-'].update(f"{transaction[0]['Created_Time']}")
     icb_session.window['-Ledger_Customer_Input-'].update(f"{transaction[0]['Customer']}")
     icb_session.window['-Ledger_Vendor_Input-'].update(f"{transaction[0]['Vendor']}")
     icb_session.window['-Transaction_Notes_Display-'].update(f"{transaction[0]['Notes']}")
@@ -1823,7 +1732,7 @@ def load_transaction_details(transaction_number):
 
 def add_transaction_to_database(values):
     """Adds a transaction to the database."""
-    current_time = get_current_time_info()
+    timestamp = iceberg_time.storage_timestamp()
 
     #print(icb_session.transaction_date)
     this_credit_account = int(values[f'-Transaction_Credit_Account_{icb_session.num}-'][0:5])
@@ -1840,11 +1749,12 @@ def add_transaction_to_database(values):
     #this_customer = values[f"-Transaction_Customer_{icb_session.num}-"]
     this_transaction_date = values[f'-Transaction_Date_String_{icb_session.num}-']
     add_transaction_query = f"""INSERT INTO {icb_session.ledger_name} (Credit_Acct, Debit_Acct, Amount, Name, Notes, Created_Time, Edited_Time, Transaction_Date, Record_Image, Vendor)
-    VALUES ({this_credit_account},{this_debit_account},{this_amount},"{this_name}","{this_notes}","{current_time[1]}","{current_time[1]}","{this_transaction_date}","{this_image}","{this_vendor}");"""
+    VALUES ({this_credit_account},{this_debit_account},{this_amount},"{this_name}","{this_notes}","{timestamp}","{timestamp}","{this_transaction_date}","{this_image}","{this_vendor}");"""
     #print(add_transaction_query)
     added_transaction = db.execute_query(icb_session.connection,add_transaction_query)
     #print(added_transaction)
-    icb_session.current_console_messages = icb_session.console_log(f"Transaction {icb_session.num} Added: {added_transaction}",icb_session.current_console_messages)
+    icb_session.current_console_messages = icb_session.console_log(f"Transaction Added: {added_transaction}",icb_session.current_console_messages)
+    feedback.notify(icb_session.window, THEME, f"Transaction '{this_name}' for {format_currency(this_amount)} recorded.", "success" if added_transaction == "Query executed successfully" else "error")
 
 def convert_pdf_to_png(image_url):
     """Converts a pdf file to png images. 
@@ -1882,7 +1792,7 @@ def add_account_to_database(values):
     13: Liability Accounts
     14: Owner Equity Contribution Accounts
     15: Revenue Accounts"""
-    current_time = get_current_time_info()
+    timestamp = iceberg_time.storage_timestamp()
     #print(current_time)
     account_type = int(values[f'-Account_Type_Picker_{icb_session.num}-'][:2])
     #print(account_type)
@@ -1911,8 +1821,8 @@ def add_account_to_database(values):
             new_account_number,
             new_account_name,
             new_account_notes,
-            current_time[1],
-            current_time[1],
+            timestamp,
+            timestamp,
             new_account_bank,
             new_account_bank_type,
             new_account_routing,
@@ -1981,6 +1891,8 @@ def update_chart_of_accounts(window, values, acct_types, year):
         balance = format_currency(balance)
         
         chart_of_accounts_display_content.append([account_Id,account_Name,credits, debits, balance])
+    icb_session.chart_rows = chart_of_accounts_display_content
+    TABLE_SORTER.register("-Chart_of_Accounts_Content-", icb_session.chart_rows)
     window['-Chart_of_Accounts_Content-'].update(chart_of_accounts_display_content)        
     return chart_of_accounts_display_content
 
@@ -2006,6 +1918,7 @@ def update_pos_view(window,values):
                     #print(f"total: {total}") 
                     icb_session.invoices.append([f"{invoice['Invoice_ID']}",f"{customer['Customer_First_Name']} {customer['Customer_Last_Name']}",f"{customer['Customer_Phone_Number']}",f"{customer['Customer_Email']}",total, f"{invoice['Status']}"])
                 icb_session.invoices.sort(reverse=True)
+            TABLE_SORTER.register("-View_POS_Content-", icb_session.invoices)
             icb_session.window["-View_POS_Content-"].update(icb_session.invoices)
     else:
         icb_session.invoices= []  
@@ -2017,6 +1930,7 @@ def update_pos_view(window,values):
                 total = format_currency(invoice['Total'])
                 #print(f"total: {total}") 
                 icb_session.invoices.append([f"{invoice['Invoice_ID']}",f"{customer[0]['Customer_First_Name']} {customer[0]['Customer_Last_Name']}",f"{customer[0]['Customer_Phone_Number']}",f"{customer[0]['Customer_Email']}",f"{total}", f"{invoice['Status']}"])
+            TABLE_SORTER.register("-View_POS_Content-", icb_session.invoices)
             icb_session.window["-View_POS_Content-"].update(icb_session.invoices)
     window['-POS_Number_Display-'].update(f"Invoice Number")
     window['-POS_CustomerName_Input-'].update("")
@@ -2030,6 +1944,7 @@ def update_pos_view(window,values):
     window['-POS_DueDate_Input-'].update(f"")
     window['-POS_Status_Input-'].update("")
     window['-Edit_POS_Button-'].update("Edit Invoice")
+    window['-POS_History_Content-'].update([])
 
 
 def load_single_invoice(window, values, invoice_id):
@@ -2059,11 +1974,12 @@ def load_single_invoice(window, values, invoice_id):
             window['-POS_DueDate_Input-'].update(f"{icb_session.this_invoice['Due_Date']}")
             window['-POS_Status_Input-'].update(icb_session.this_invoice['Status'])
             window['-View_POS_Button-'].update(f"{icb_session.this_invoice['Location']}")
+            load_invoice_history(window, icb_session.this_invoice)
 
 
 def add_service_to_database(window,values):
     """Adds a service to the database based on the form input."""
-    current_time = get_current_time_info()
+    timestamp = iceberg_time.storage_timestamp()
     add_service_number = icb_session.service_number
     add_service_description = values[f"""-Service_Description_{icb_session.num}-"""]
     add_service_long_description = values[f"""-Service_Long_Description_{icb_session.num}-"""]
@@ -2073,8 +1989,9 @@ def add_service_to_database(window,values):
     add_service_price= convert_dollars_to_cents(price_input)
     add_service_taxable = values[f"""-Service_Taxable_{icb_session.num}-"""]
     sku_repo = SkuRepository(icb_session.connection)
-    added_service = sku_repo.insert(add_service_number, add_service_description.replace("'","''"), add_service_long_description, add_service_price, add_service_taxable, "False", "Service", current_time[1], current_time[1])
+    added_service = sku_repo.insert(add_service_number, add_service_description.replace("'","''"), add_service_long_description, add_service_price, add_service_taxable, "False", "Service", timestamp, timestamp)
     icb_session.current_console_messages = icb_session.console_log(f"Added Service {add_service_number}: {added_service}",icb_session.current_console_messages)
+    feedback.notify(icb_session.window, THEME, f"Service {add_service_number} added.", "success" if added_service == "Query executed successfully" else "error")
 
 def load_services_tab(window,values):
     """Refreshes the services view panel."""
@@ -2086,6 +2003,7 @@ def load_services_tab(window,values):
         icb_session.services= []        
         for service in services:
             icb_session.services.append([f"{service['Sku']}",f"{service['Description']}",f"{format_currency(service['Price'])}",f"{service['Taxable']}"])
+        TABLE_SORTER.register("-View_Services_Content-", icb_session.services)
         icb_session.window["-View_Services_Content-"].update(icb_session.services)
         window['-Service_Sku_Input-'].update("")
         window['-Service_Description_Input-'].update("")
@@ -2144,20 +2062,23 @@ def activate_edit_transaction_fields(window,values):
             this_transaction_index = ledger_content[0]
             this_transaction = icb_session.transactions[this_transaction_index][0]
 
-        amount_int = ""
-
-        if values['-Ledger_Amount_Input-'][0] == "$":
-            amount_int = convert_dollars_to_cents(values['-Ledger_Amount_Input-'][1:].replace(",",""))
-        else:
-            amount_int = convert_dollars_to_cents(values['-Ledger_Amount_Input-'][0:].replace(",",""))
-        
-        update_transaction_query = f"""UPDATE '{icb_session.ledger_name}' SET Credit_Acct = '{values['-Ledger_Credit_Input-']}', 
-        Debit_Acct = '{values['-Ledger_Debit_Input-']}', Amount = '{amount_int}', 
-        Notes = '{values['-Transaction_Notes_Display-']}', Transaction_Date = '{values['-Ledger_Date_Input-']}', 
-        Vendor = '{values['-Ledger_Vendor_Input-']}', Customer = '{values['-Ledger_Customer_Input-']}', 
-        Name = '{values['-Ledger_Name_Input-']}', Edited_Time = '{now}'  WHERE Transaction_ID='{this_transaction}';"""
+        checked = validation.validate_transaction(
+            {"name": values['-Ledger_Name_Input-'], "date": values['-Ledger_Date_Input-'], "amount": values['-Ledger_Amount_Input-'],
+             "debit_account": values['-Ledger_Debit_Input-'], "credit_account": values['-Ledger_Credit_Input-']},
+            [a['Account_ID'] for a in AccountRepository(icb_session.connection).get_all()],
+        )
+        if not checked.ok:
+            sg.popup_error("The transaction was not saved:\n\n" + checked.message(), title="Iceberg - check the transaction")
+            icb_session.current_console_messages = icb_session.console_log(f"Transaction {this_transaction} not saved: {'; '.join(checked.errors)}", icb_session.current_console_messages)
+            return
+        cleaned = checked.cleaned
+        update_transaction_query = f"""UPDATE '{icb_session.ledger_name}' SET Credit_Acct = '{cleaned['credit_account']}', 
+        Debit_Acct = '{cleaned['debit_account']}', Amount = '{cleaned['amount']}', 
+        Notes = '{accounting.sql_text(values['-Transaction_Notes_Display-'])}', Transaction_Date = '{cleaned['date']}', 
+        Vendor = '{accounting.sql_text(values['-Ledger_Vendor_Input-'])}', Customer = '{accounting.sql_text(values['-Ledger_Customer_Input-'])}', 
+        Name = '{accounting.sql_text(cleaned['name'])}', Edited_Time = '{iceberg_time.storage_timestamp()}'  WHERE Transaction_ID='{this_transaction}';"""
         query_executed = db.execute_query(icb_session.connection,update_transaction_query)
-        icb_session.console_log(query_executed,icb_session.current_console_messages)
+        icb_session.console_log(f"Transaction {this_transaction} updated: {query_executed}",icb_session.current_console_messages)
         window['-Ledger_Name_Input-'].update(disabled=True)
         window['-Ledger_Date_Input-'].update(disabled=True)
         window['-Ledger_Amount_Input-'].update(disabled=True)
@@ -2239,7 +2160,7 @@ def generate_new_invoice(new_invoice_window, values_newi, date):
     #Check the status and set the date
     invoice_paid_date = icb_session.this_invoice['Due_Date'][:10]
     if icb_session.this_invoice['Status'] == 'Paid' or icb_session.this_invoice['Status'] == 'Refunded' or icb_session.this_invoice['Status'] == 'Canceled':
-        invoice_paid_date = f"{now}"[:10]
+        invoice_paid_date = iceberg_time.local_date_string()
 
 
     #Set text attributes
@@ -2361,8 +2282,8 @@ def save_invoice_to_database(window,values,filepath):
         tracking_code=icb_session.this_invoice['Tracking_Code'],
         line_items=line_items_str,
         due_date=icb_session.this_invoice['Due_Date'][:10],
-        created_time=f'{now}',
-        edited_time=f'{now}',
+        created_time=iceberg_time.storage_timestamp(),
+        edited_time=iceberg_time.storage_timestamp(),
         subtotal=icb_session.this_invoice['Subtotal'],
         sales_tax=icb_session.this_invoice['Sales_Tax'],
         total=icb_session.this_invoice['Total'],
@@ -2371,31 +2292,15 @@ def save_invoice_to_database(window,values,filepath):
         location=filepath
     )
 
-    #Save the transaction 
-    
-    count_transactions_query = f"""SELECT COUNT(*) FROM {icb_session.ledger_name};"""
-    transactions_count = db.execute_read_query_dict(icb_session.connection,count_transactions_query)
-    #print(transactions_count)
-
-    this_invoice_subtotal = int(icb_session.this_invoice['Subtotal'])
-    accounts_receivable_transaction = int(transactions_count[0]['COUNT(*)'])+1
-    add_transaction_query = f"""INSERT INTO {icb_session.ledger_name} (Transaction_ID, Credit_Acct, Debit_Acct, Amount, Name, Notes, Created_Time, 
-    Edited_Time, Transaction_Date, Record_Image, Vendor, Customer) VALUES ('{accounts_receivable_transaction}',
-    '15001','{icb_session.transaction_debit_account}', '{this_invoice_subtotal}', 'Invoice {icb_session.this_invoice['Invoice_ID']}', 
-    '{icb_session.this_invoice['Tracking_Code']}', '{icb_session.current_time_display[0]}', '{icb_session.current_time_display[0]}', '{f"{now}"[:10]}', '{icb_session.this_invoice['Location']}', '', 
-    '{icb_session.this_invoice['Customer_ID']}');"""
-    added_transaction = db.execute_query(icb_session.connection, add_transaction_query)
-    print(f"added_transaction: {added_transaction}")
-
-    this_invoice_sales_tax = int(icb_session.this_invoice['Sales_Tax'])
-    add_transaction_query = f"""INSERT INTO {icb_session.ledger_name} (Transaction_ID, Credit_Acct, Debit_Acct, Amount, Name, Notes, Created_Time, 
-    Edited_Time, Transaction_Date, Record_Image, Vendor, Customer) VALUES ('{accounts_receivable_transaction+1}',
-    '13003','{icb_session.transaction_debit_account}', '{this_invoice_sales_tax}', 'Invoice {icb_session.this_invoice['Invoice_ID']} Sales Tax Payable', 
-    '{icb_session.this_invoice['Tracking_Code']}', '{icb_session.current_time_display[0]}', '{icb_session.current_time_display[0]}', '{f"{now}"[:10]}', '{icb_session.this_invoice['Location']}', '', 
-    '{icb_session.this_invoice['Customer_ID']}');"""
-    added_transaction = db.execute_query(icb_session.connection, add_transaction_query)
-    print(f"added_transaction: {added_transaction}")
-    #write_transaction_query = f"""INSERT INTO {icb_session.ledger_name} ()"""
+    #Post the ledger entries and the first history event through the lifecycle module
+    posted = invoice_repo.get_by_id(icb_session.this_invoice['Invoice_ID'])
+    deposit_account = icb_session.transaction_debit_account if posted['Status'] == 'Paid' else None
+    try:
+        entry_ids = invoice_lifecycle.post_invoice(icb_session.connection, icb_session.ledger_name, posted, deposit_account=deposit_account)
+        icb_session.current_console_messages = icb_session.console_log(f"Invoice {posted['Invoice_ID']} posted ({posted['Status']}); ledger entries {', '.join(str(i) for i in entry_ids)}.", icb_session.current_console_messages)
+    except invoice_lifecycle.InvoiceError as error:
+        icb_session.current_console_messages = icb_session.console_log(f"Invoice {posted['Invoice_ID']} saved but ledger entries failed: {error}", icb_session.current_console_messages)
+        sg.popup_error(f"The invoice was saved but its ledger entries could not be written.\n\n{error}", title="Iceberg - invoice")
 
     return save_invoice
 
@@ -2406,19 +2311,24 @@ def save_invoice_to_database(window,values,filepath):
 
 
 def update_database_properties(window,values):
-    icb_session.sales_tax = f"{dec(values['-Edit_Sales_Tax-'])/100}"
+    checked = validation.validate_database_properties(
+        {"business_name": values['-edit_db_name-'], "address": values['-Edit_Business_Address-'], "sales_tax": values['-Edit_Sales_Tax-'],
+         "receipts_location": values['-Edit_Receipts_Repository-']}, new_database=False)
+    if not show_validation_errors(checked, "database properties"):
+        return
+    icb_session.sales_tax = f"{checked.cleaned['sales_tax']}"
 
     database_properties = [
-        ["Business Name",f"{values['-edit_db_name-']}".replace("'","''"),"",icb_session.current_time_display[0],icb_session.current_time_display[0]],
-        ["Address",f"{values['-Edit_Business_Address-']}".replace("'","''"),"",icb_session.current_time_display[0],icb_session.current_time_display[0]],
-        ["Owner or Financial Officer Name",f"{values['-Edit_Business_Officer-']}".replace("'","''"),"",icb_session.current_time_display[0],icb_session.current_time_display[0]],
-        ["Title or Position",f"{values['-Edit_Business_Officer_Title-']}".replace("'","''"),"",icb_session.current_time_display[0],icb_session.current_time_display[0]],
-        ["Phone Number",f"{values['-Edit_Business_Phone-']}".replace("'","''"),"",icb_session.current_time_display[0],icb_session.current_time_display[0]],
-        ["Email",f"{values['-Edit_Business_Email-']}".replace("'","''"),"",icb_session.current_time_display[0],icb_session.current_time_display[0]],
-        ["Notes",values[f"-Edit_Business_Notes-"],"",icb_session.current_time_display[0],icb_session.current_time_display[0]],
-        ["EIN or SSN",values[f"-Edit_Business_EIN-"],"",icb_session.current_time_display[0],icb_session.current_time_display[0]],
-        ["Receipts Repository Location",values[f"-Edit_Receipts_Repository-"],"",icb_session.current_time_display[0],icb_session.current_time_display[0]],
-        ["Sales Tax",icb_session.sales_tax,"",icb_session.current_time_display[0],icb_session.current_time_display[0]],
+        ["Business Name",f"{values['-edit_db_name-']}".replace("'","''"),"",iceberg_time.storage_timestamp(),iceberg_time.storage_timestamp()],
+        ["Address",f"{values['-Edit_Business_Address-']}".replace("'","''"),"",iceberg_time.storage_timestamp(),iceberg_time.storage_timestamp()],
+        ["Owner or Financial Officer Name",f"{values['-Edit_Business_Officer-']}".replace("'","''"),"",iceberg_time.storage_timestamp(),iceberg_time.storage_timestamp()],
+        ["Title or Position",f"{values['-Edit_Business_Officer_Title-']}".replace("'","''"),"",iceberg_time.storage_timestamp(),iceberg_time.storage_timestamp()],
+        ["Phone Number",f"{values['-Edit_Business_Phone-']}".replace("'","''"),"",iceberg_time.storage_timestamp(),iceberg_time.storage_timestamp()],
+        ["Email",f"{values['-Edit_Business_Email-']}".replace("'","''"),"",iceberg_time.storage_timestamp(),iceberg_time.storage_timestamp()],
+        ["Notes",values[f"-Edit_Business_Notes-"],"",iceberg_time.storage_timestamp(),iceberg_time.storage_timestamp()],
+        ["EIN or SSN",values[f"-Edit_Business_EIN-"],"",iceberg_time.storage_timestamp(),iceberg_time.storage_timestamp()],
+        ["Receipts Repository Location",values[f"-Edit_Receipts_Repository-"],"",iceberg_time.storage_timestamp(),iceberg_time.storage_timestamp()],
+        ["Sales Tax",icb_session.sales_tax,"",iceberg_time.storage_timestamp(),iceberg_time.storage_timestamp()],
     ]    
     property_repo = PropertyRepository(icb_session.connection)
     for db_property in database_properties:
@@ -2437,7 +2347,7 @@ def update_sku(window,values):
 
     sku_repo = SkuRepository(icb_session.connection)
     price_val = int(dec(f"{f'{this_price}'.replace('$','')}".replace(',',''))*100)
-    this_updated_sku = sku_repo.update(this_sku, this_description, this_long_description, price_val, this_taxable, icb_session.current_time_display[0])
+    this_updated_sku = sku_repo.update(this_sku, this_description, this_long_description, price_val, this_taxable, iceberg_time.storage_timestamp())
     icb_session.console_log(this_updated_sku,icb_session.current_console_messages)
     
 def update_customer(window,values):
@@ -2464,7 +2374,7 @@ def update_customer(window,values):
         address=this_customer_address,
         email=this_customer_email,
         notes=this_customer_notes,
-        edited_time=icb_session.current_time_display[0]
+        edited_time=iceberg_time.storage_timestamp()
     )
     icb_session.console_log(this_updated_customer,icb_session.current_console_messages)    
 
@@ -2484,7 +2394,7 @@ def update_vendor(window,values):
     this_vendor_notes = values['-Vendor_Notes_Display-']
 
     vendor_repo = VendorRepository(icb_session.connection)
-    this_updated_vendor = vendor_repo.update(this_vendor, this_vendor_name, this_vendor_category, this_vendor_first, this_vendor_last, this_vendor_preferred, this_vendor_phone, this_vendor_phone_type, this_vendor_address, this_vendor_email, this_vendor_website, this_vendor_notes, icb_session.current_time_display[0])
+    this_updated_vendor = vendor_repo.update(this_vendor, this_vendor_name, this_vendor_category, this_vendor_first, this_vendor_last, this_vendor_preferred, this_vendor_phone, this_vendor_phone_type, this_vendor_address, this_vendor_email, this_vendor_website, this_vendor_notes, iceberg_time.storage_timestamp())
     icb_session.console_log(this_updated_vendor,icb_session.current_console_messages)    
 
 
@@ -2498,9 +2408,479 @@ def update_vendor(window,values):
 #░▒▓█▓▒░          ░▒▓█▓▓█▓▒░   ░▒▓█▓▒░        ░▒▓█▓▒░░▒▓█▓▒░    ░▒▓█▓▒░           ░▒▓█▓▒░        ░▒▓█▓▒░░▒▓█▓▒░ ░▒▓█▓▒░░▒▓█▓▒░ ░▒▓█▓▒░        
 #░▒▓████████▓▒░    ░▒▓██▓▒░    ░▒▓████████▓▒░ ░▒▓█▓▒░░▒▓█▓▒░    ░▒▓█▓▒░           ░▒▓████████▓▒░  ░▒▓██████▓▒░   ░▒▓██████▓▒░  ░▒▓█▓▒░        
                                                                                                                                         
-icb_session.window = sg.Window(title="Iceberg Accounting Suite", layout= layout1, margins=(10,10), resizable=True, size=(1280,980), finalize=True)
+def open_database_from_key(session, key_file_path):
+    """Open the .icb that belongs to ``key_file_path`` into memory.
+
+    Returns True on success.  On failure the reason is logged to the console
+    and shown in a dialog, and the session is left without a database.
+    """
+    key_file_path = key_file_path.replace("\\", "/")
+    directory, key_name = os.path.split(key_file_path)
+    db_name = key_name[:-3]  # strip "key" -> "<name>.icb"
+    save_location = normalized_save_location(directory)
+    try:
+        connection, filekey = db.open_database(key_name, db_name, save_location)
+    except db.DatabaseError as error:
+        session.current_console_messages = session.console_log(f"Open Database failed: {error}", session.current_console_messages)
+        sg.popup_error(f"The database could not be opened.\n\n{error}", title="Iceberg - open failed")
+        return False
+    session.connection = connection
+    session.filekey = filekey
+    session.filename = key_name
+    session.db_name = db_name
+    session.save_location = save_location
+    session.database_loaded = True
+    session.last_autosave = iceberg_time.monotonic()
+    session.reset_change_tracking()
+    session.mark_saved()
+    navigation.set_enabled(session.window, True)
+    feedback.notify(session.window, THEME, f"Opened {db_name}.", "success")
+    return True
+
+
+def restore_database_from_backup(session, values):
+    """Let the user pick a timestamped backup and restore it (ST-004)."""
+    if not session.database_loaded:
+        sg.popup_error("Open a database first, then choose the backup to restore.", title="Iceberg - restore")
+        return False
+    db_path = f"./{session.db_name}"
+    available = backups.list_backups(db_path)
+    if not available:
+        sg.popup_error(
+            f"No backups were found in {backups.backup_directory(db_path)}.\n\nBackups are written every time the database is saved.",
+            title="Iceberg - restore",
+        )
+        return False
+    labels = [f"{backups.describe_backup(path)}    {os.path.basename(path)}" for path in available]
+    session.num = session.num + 1
+    layout = [
+        [sg.Text("Select the backup to restore. The current file is preserved as a new backup first.", font=("", medium_print))],
+        [sg.Listbox(values=labels, size=(90, 12), key=f"-Restore_List_{session.num}-", font=("", medium_print))],
+        [sg.Button("Restore", key=f"-Restore_Button_{session.num}-"), sg.Button("Cancel", key=f"-Restore_Cancel_{session.num}-")],
+    ]
+    restore_window = sg.Window(title="Restore from Backup", layout=layout, margins=(10, 10), resizable=True, modal=True)
+    event_restore, values_restore = restore_window.read(close=True)
+    if event_restore != f"-Restore_Button_{session.num}-" or not values_restore or not values_restore.get(f"-Restore_List_{session.num}-"):
+        return False
+    chosen = available[labels.index(values_restore[f"-Restore_List_{session.num}-"][0])]
+    confirm = sg.popup_yes_no(
+        f"Replace {session.db_name} with the backup from {backups.describe_backup(chosen)}?\n\nUnsaved changes in the open database will be discarded.",
+        title="Iceberg - confirm restore",
+    )
+    if confirm != "Yes":
+        return False
+    try:
+        safety_copy = backups.restore_backup(chosen, db_path)
+    except backups.BackupError as error:
+        session.current_console_messages = session.console_log(f"Restore failed: {error}", session.current_console_messages)
+        sg.popup_error(f"The backup could not be restored.\n\n{error}", title="Iceberg - restore failed")
+        return False
+    session.current_console_messages = session.console_log(
+        f"Restored {session.db_name} from {chosen}. Previous file kept as {safety_copy}.", session.current_console_messages
+    )
+    key_path = os.path.join(session.save_location, session.filename)
+    if open_database_from_key(session, key_path):
+        property_repo = PropertyRepository(session.connection)
+        session.ledger_name = property_repo.get('Ledger Name') or ""
+        prepare_schema(session)
+        session.window, _ = update_dashboard_statistics(session.window, values)
+        session.current_console_messages = session.console_log("Dashboard statistics updated.", session.current_console_messages)
+        return True
+    return False
+
+
+def sort_table(window, key, col):
+    """Sort a data table by the clicked column and refresh it (ST-017)."""
+    outcome = TABLE_SORTER.sort(key, col)
+    if not outcome:
+        return
+    rows, _, descending = outcome
+    window[key].update(rows)
+    headings = TABLE_SORTER.headings_with_indicator(key)
+    if headings:
+        try:
+            widget = window[key].Widget
+            for column_id, heading in zip(widget["columns"], headings):
+                widget.heading(column_id, text=heading)
+        except Exception:
+            pass
+    feedback.notify(window, THEME, f"Sorted by column {col + 1} ({'descending' if descending else 'ascending'}).", "info")
+
+
+def focus_search_box(session):
+    """Ctrl+F: put the cursor in the search box of the visible tab (ST-011)."""
+    for index, key in navigation_search_fields():
+        try:
+            if session.window[navigation.TAB_KEYS[index]].visible:
+                accessibility.focus_first_input(session.window, key)
+                return
+        except Exception:
+            continue
+    feedback.notify(session.window, THEME, "This tab has no search box.", "info")
+
+
+def navigation_search_fields():
+    return sorted(accessibility.SEARCH_FIELDS.items())
+
+
+def show_preferences_dialog(session):
+    """Theme and text size preferences (ST-020).  Changes apply at the next launch."""
+    session.num = session.num + 1
+    n = session.num
+    theme_labels = {"light": "Light", "dark": "Dark", "high-contrast": "High contrast"}
+    current_theme = theme_labels[PREFS["theme"]]
+    current_scale = preferences.scale_label(PREFS["text_scale"])
+    layout = [
+        [forms.label(sg, THEME, "Appearance", width=14), sg.Combo(list(theme_labels.values()), default_value=current_theme, readonly=True, size=(20, 1), key=f"-Pref_Theme_{n}-")],
+        [forms.label(sg, THEME, "Text size", width=14), sg.Combo([preferences.scale_label(s) for s in preferences.TEXT_SCALES], default_value=current_scale, readonly=True, size=(20, 1), key=f"-Pref_Scale_{n}-")],
+        [forms.label(sg, THEME, "Compact rows", width=14), sg.Checkbox("Use tighter spacing in tables and panels", default=PREFS["compact"], key=f"-Pref_Compact_{n}-")],
+        [sg.Text("Changes take effect the next time Iceberg starts.", font=THEME.font("small"), text_color=THEME.color("info"))],
+        [sg.Button("Save", key=f"-Pref_Save_{n}-", bind_return_key=True), sg.Button("Cancel", key=f"-Pref_Cancel_{n}-")],
+    ]
+    window = sg.Window(title="Display preferences", layout=layout, margins=(10, 10), modal=True, finalize=True)
+    accessibility.focus_first_input(window, f"-Pref_Theme_{n}-")
+    event_pref, values_pref = window.read(close=True)
+    if event_pref != f"-Pref_Save_{n}-" or not values_pref:
+        return False
+    chosen_theme = next((k for k, v in theme_labels.items() if v == values_pref[f"-Pref_Theme_{n}-"]), "light")
+    new_prefs = {"theme": chosen_theme, "text_scale": preferences.scale_from_label(values_pref[f"-Pref_Scale_{n}-"]), "compact": bool(values_pref[f"-Pref_Compact_{n}-"])}
+    try:
+        preferences.save(new_prefs)
+    except OSError as error:
+        sg.popup_error(f"Preferences could not be saved: {error}", title="Iceberg - preferences")
+        return False
+    PREFS.update(preferences.normalize(new_prefs))
+    session.current_console_messages = session.console_log(f"Preferences saved ({chosen_theme}, {values_pref[f'-Pref_Scale_{n}-']} text). Restart Iceberg to apply.", session.current_console_messages)
+    feedback.notify(session.window, THEME, "Preferences saved. Restart Iceberg to apply the new appearance.", "success")
+    return True
+
+
+def prepare_schema(session):
+    """Create/upgrade the optional tables used by the P1 features (idempotent)."""
+    if not session.connection or not session.ledger_name:
+        return
+    invoice_lifecycle.ensure_schema(session.connection)
+    reconciliation.ensure_schema(session.connection, session.ledger_name)
+
+
+def show_validation_errors(result, what):
+    """Show blocking errors (and return False) or confirm warnings (return True/False)."""
+    if not result.ok:
+        sg.popup_error(f"The {what} was not saved. Please fix the following:\n\n{result.message()}", title=f"Iceberg - check the {what}")
+        icb_session.current_console_messages = icb_session.console_log(f"{what.capitalize()} not saved: {'; '.join(result.errors)}", icb_session.current_console_messages)
+        feedback.notify(icb_session.window, THEME, f"{what.capitalize()} not saved: {result.errors[0]}", "error")
+        return False
+    if result.warnings:
+        answer = sg.popup_yes_no("Please confirm:\n\n" + "\n".join(f"- {w}" for w in result.warnings) + f"\n\nSave the {what} anyway?", title=f"Iceberg - confirm {what}")
+        return answer == "Yes"
+    return True
+
+
+def account_ids(session):
+    return [a['Account_ID'] for a in AccountRepository(session.connection).get_all()]
+
+
+def load_invoice_history(window, invoice):
+    """Fill the invoice history table on the Point of Sale tab (ST-008)."""
+    try:
+        names = accounting.account_name_map(AccountRepository(icb_session.connection).get_all())
+        items = invoice_lifecycle.timeline(icb_session.connection, icb_session.ledger_name, invoice, names)
+        window['-POS_History_Content-'].update(invoice_lifecycle.timeline_rows(items))
+    except Exception as error:
+        window['-POS_History_Content-'].update([])
+        icb_session.current_console_messages = icb_session.console_log(f"Invoice history could not be loaded: {error}", icb_session.current_console_messages)
+
+
+def choose_account_window(title, prompt):
+    """Small modal dialog returning the chosen asset account number or None."""
+    account_repo = AccountRepository(icb_session.connection)
+    options = [f"{a['Account_ID']} {a['Name']}" for a in account_repo.get_by_type_prefix('10') if str(a['Account_ID']) != accounting.ACCOUNTS_RECEIVABLE]
+    if not options:
+        sg.popup_error("There are no asset accounts to choose from.", title=title)
+        return None
+    icb_session.num = icb_session.num + 1
+    key = f"-Choose_Account_{icb_session.num}-"
+    layout = [[sg.Text(prompt, font=("", medium_print))], [sg.Combo(options, default_value=options[0], readonly=True, size=(40, 1), key=key)],
+              [sg.Button("Save", key=f"-Choose_Account_OK_{icb_session.num}-"), sg.Button("Cancel", key=f"-Choose_Account_Cancel_{icb_session.num}-")]]
+    window = sg.Window(title=title, layout=layout, margins=(10, 10), modal=True)
+    event_choice, values_choice = window.read(close=True)
+    if event_choice != f"-Choose_Account_OK_{icb_session.num}-" or not values_choice or not values_choice.get(key):
+        return None
+    return values_choice[key][:5]
+
+
+def change_invoice_status(session, values):
+    """Apply the status chosen on the Point of Sale tab through the lifecycle module (ST-008)."""
+    invoice_id = values['-POS_Number_Display-'][8:]
+    new_status = values['-POS_Status_Input-']
+    invoice_repo = InvoiceRepository(session.connection)
+    invoice = invoice_repo.get_by_id(invoice_id)
+    if not invoice or isinstance(invoice, str):
+        session.current_console_messages = session.console_log("Select an invoice first.", session.current_console_messages)
+        return False
+    problem = invoice_lifecycle.check_transition(invoice['Status'], new_status)
+    if problem:
+        sg.popup_error(problem, title="Iceberg - invoice status")
+        session.current_console_messages = session.console_log(f"Invoice {invoice_id}: {problem}", session.current_console_messages)
+        return False
+    account = None
+    if new_status in invoice_lifecycle.NEEDS_ACCOUNT:
+        prompt = "Account where the payment was deposited:" if new_status == "Paid" else "Account the refund was paid from:"
+        account = choose_account_window("Select account", prompt)
+        if not account:
+            session.current_console_messages = session.console_log(f"Invoice {invoice_id}: status change cancelled (no account selected).", session.current_console_messages)
+            return False
+    result = invoice_lifecycle.change_status(session.connection, session.ledger_name, invoice, new_status, account=account, invoice_repo=invoice_repo)
+    session.current_console_messages = session.console_log(result['message'], session.current_console_messages)
+    if not result['ok']:
+        sg.popup_error(result['message'], title="Iceberg - invoice status")
+        return False
+    session.this_invoice = invoice
+    session.these_line_items = ast.literal_eval(invoice['Line_Items'])
+    try:
+        generate_new_invoice(session.window, values, iceberg_time.local_date_from_timestamp(invoice['Created_Time']))
+    except Exception as error:
+        session.current_console_messages = session.console_log(f"Invoice PDF was not regenerated: {error}", session.current_console_messages)
+    update_pos_view(session.window, values)
+    load_single_invoice(session.window, values, invoice_id)
+    return True
+
+
+def open_reconcile_tab(session, values, account_id=None):
+    """Show the Reconcile tab with the account list loaded (ST-006)."""
+    if not session.connection:
+        return
+    accounts = AccountRepository(session.connection).get_all()
+    options = [f"{a['Account_ID']} - {a['Name']}" for a in accounts]
+    chosen = next((o for o in options if account_id and o.startswith(str(account_id))), options[0] if options else "")
+    session.window['-Reconcile_Account-'].update(value=chosen, values=options)
+    if not values.get('-Reconcile_Date-'):
+        session.window['-Reconcile_Date-'].update(iceberg_time.local_date_string())
+    session.window['-Reconcile_List-'].update([])
+    session.window['-Reconcile_Summary-'].update("Enter the statement date and ending balance, then select Load Transactions.")
+    session.window['-Reconcile_Finish-'].update(disabled=True)
+    session.reconcile_session = None
+    session.reconcile_items = []
+    show_tab(session.window, 12)
+
+
+def reconcile_line(view):
+    amount = format_currency(view['Amount'])
+    return f"{view['Transaction_ID']:>6}  {view['Transaction_Date']}  {view['Name'][:48]:<48} {amount:>16}"
+
+
+def load_reconciliation(session, values):
+    checked = validation.validate_reconciliation_inputs(values['-Reconcile_Date-'], values['-Reconcile_Balance-'])
+    if not checked.ok:
+        sg.popup_error(checked.message(), title="Iceberg - reconcile")
+        return
+    account_text = values['-Reconcile_Account-'] or ""
+    if not account_text:
+        sg.popup_error("Select an account to reconcile.", title="Iceberg - reconcile")
+        return
+    account_id = account_text[:5]
+    session.reconcile_statement_balance = checked.cleaned['statement_balance']
+    session.reconcile_session = reconciliation.start(session.connection, session.ledger_name, account_id, checked.cleaned['statement_date'])
+    session.reconcile_items = [(reconcile_line(v), v['Transaction_ID']) for v in session.reconcile_session['candidates']]
+    session.window['-Reconcile_List-'].update([line for line, _ in session.reconcile_items])
+    session.window['-Reconcile_Title-'].update(f"Reconcile {account_text} through {checked.cleaned['statement_date']}")
+    update_reconciliation_summary(session, [])
+    later = session.reconcile_session['later_reconciled']
+    if later:
+        session.current_console_messages = session.console_log(f"Note: {len(later)} transaction(s) dated after this statement were reconciled on a later statement.", session.current_console_messages)
+
+
+def selected_reconcile_ids(session, values):
+    chosen = set(values.get('-Reconcile_List-') or [])
+    return [tid for line, tid in session.reconcile_items if line in chosen]
+
+
+def update_reconciliation_summary(session, cleared_ids):
+    if not session.reconcile_session:
+        return None
+    summary = reconciliation.summarize(session.reconcile_session, cleared_ids, session.reconcile_statement_balance)
+    lines = [
+        f"Previously reconciled balance:      {format_currency(summary['reconciled_balance']):>16}   ({session.reconcile_session['reconciled_count']} transactions)",
+        f"Cleared on this statement:          {format_currency(summary['cleared_total']):>16}   ({summary['cleared_count']} transactions)",
+        f"Cleared balance:                    {format_currency(summary['cleared_balance']):>16}",
+        f"Statement ending balance:           {format_currency(summary['statement_balance']):>16}",
+        f"Difference:                         {format_currency(summary['difference']):>16}   {'BALANCED - select Finish Reconciliation' if summary['balanced'] else 'not balanced yet'}",
+        f"Unmatched (not on statement):       {format_currency(summary['unmatched_total']):>16}   ({len(summary['unmatched'])} transactions)",
+    ]
+    session.window['-Reconcile_Summary-'].update("\n".join(lines))
+    session.window['-Reconcile_Finish-'].update(disabled=not summary['balanced'])
+    return summary
+
+
+def finish_reconciliation(session, values):
+    if not session.reconcile_session:
+        return
+    cleared = selected_reconcile_ids(session, values)
+    try:
+        summary = reconciliation.complete(session.connection, session.ledger_name, session.reconcile_session, cleared, session.reconcile_statement_balance)
+    except reconciliation.ReconciliationError as error:
+        sg.popup_error(str(error), title="Iceberg - reconcile")
+        return
+    account = session.reconcile_session['account_id']
+    session.current_console_messages = session.console_log(
+        f"Reconciled account {account} through {session.reconcile_session['statement_date']}: {summary['cleared_count']} transactions cleared, balance {format_currency(summary['cleared_balance'])}.",
+        session.current_console_messages)
+    save_current_database(session, reason="Save after reconciliation")
+    load_reconciliation(session, values)
+
+
+def show_reconciliation_history(session, values):
+    account_text = values.get('-Reconcile_Account-') or ""
+    rows = reconciliation.history(session.connection, account_text[:5] if account_text else None)
+    if not rows:
+        sg.popup("No reconciliations have been completed" + (f" for {account_text}." if account_text else "."), title="Reconciliation history")
+        return
+    lines = [f"{'Statement':<12}{'Account':<9}{'Statement bal.':>16}{'Cleared':>9}  Recorded"]
+    for row in rows:
+        lines.append(f"{row['Statement_Date']:<12}{row['Account_ID']:<9}{format_currency(row['Statement_Balance']):>16}{row['Cleared_Count']:>9}  {iceberg_time.display_timestamp(row['Created_Time'], seconds=False)}")
+    sg.popup_scrolled("\n".join(lines), title="Reconciliation history", font=("Courier", medium_print), size=(90, 15))
+
+
+def undo_reconciliation(session, values):
+    account_text = values.get('-Reconcile_Account-') or ""
+    if not account_text:
+        return
+    if sg.popup_yes_no(f"Undo the most recent reconciliation for {account_text}? Its transactions become unreconciled again.", title="Iceberg - undo reconciliation") != "Yes":
+        return
+    try:
+        record = reconciliation.undo_last(session.connection, session.ledger_name, account_text[:5])
+    except reconciliation.ReconciliationError as error:
+        sg.popup_error(str(error), title="Iceberg - reconcile")
+        return
+    session.current_console_messages = session.console_log(f"Undid reconciliation of {account_text} for statement {record['Statement_Date']}.", session.current_console_messages)
+    save_current_database(session, reason="Save after undoing reconciliation")
+    if session.reconcile_session:
+        load_reconciliation(session, values)
+
+
+def run_report(session, values, report_type=None):
+    """Build and display the selected financial report (ST-007)."""
+    if not session.connection:
+        return None
+    report_type = report_type or values.get('-Report_Type-') or "Income Statement"
+    session.window['-Report_Type-'].update(value=report_type)
+    try:
+        start = validation.parse_date(values.get('-Report_Start-'), "From date")
+        end = validation.parse_date(values.get('-Report_End-'), "To date")
+    except ValueError as error:
+        sg.popup_error(str(error), title="Iceberg - reports")
+        return None
+    if start > end:
+        sg.popup_error("The From date must not be after the To date.", title="Iceberg - reports")
+        return None
+    rows = accounting.read_ledger(session.connection, session.ledger_name)
+    accounts = AccountRepository(session.connection).get_all()
+    report = reports.run(report_type, rows, accounts, start, end)
+    session.last_report = report
+    session.window['-Report_Output-'].update(reports.render_text(report))
+    session.current_console_messages = session.console_log(f"Report generated: {report['title']} ({report['period']}).", session.current_console_messages)
+    return report
+
+
+def apply_report_period(session, values):
+    preset = values.get('-Report_Period-') or "This Year"
+    if preset == "Custom":
+        return
+    start, end = reports.period_bounds(preset)
+    session.window['-Report_Start-'].update(start)
+    session.window['-Report_End-'].update(end)
+    values['-Report_Start-'], values['-Report_End-'] = start, end
+
+
+def export_report_csv(session):
+    if not getattr(session, "last_report", None):
+        sg.popup_error("Run a report first.", title="Iceberg - export")
+        return
+    default = f"{session.last_report['type'].replace(' ', '_')}_{iceberg_time.file_timestamp()}.csv"
+    path = sg.popup_get_file("Save report as", save_as=True, default_path=default, file_types=(("CSV", "*.csv"),), no_window=True)
+    if not path:
+        return
+    try:
+        data_exchange.export_report(session.last_report, path)
+    except OSError as error:
+        sg.popup_error(f"The report could not be written: {error}", title="Iceberg - export")
+        return
+    session.current_console_messages = session.console_log(f"Report exported to {path}.", session.current_console_messages)
+
+
+def export_ledger_csv(session):
+    default = f"ledger_{session.db_name[:-4]}_{iceberg_time.file_timestamp()}.csv"
+    path = sg.popup_get_file("Save ledger as", save_as=True, default_path=default, file_types=(("CSV", "*.csv"),), no_window=True)
+    if not path:
+        return
+    try:
+        _, count = data_exchange.export_ledger(session.connection, session.ledger_name, AccountRepository(session.connection).get_all(), path)
+    except (OSError, data_exchange.ImportError_) as error:
+        sg.popup_error(f"The ledger could not be exported: {error}", title="Iceberg - export")
+        return
+    session.current_console_messages = session.console_log(f"Exported {count} transactions to {path}.", session.current_console_messages)
+
+
+def export_all_csv(session):
+    folder = sg.popup_get_folder("Choose a folder for the CSV files", no_window=True)
+    if not folder:
+        return
+    try:
+        written = data_exchange.export_all(session.connection, session.ledger_name, AccountRepository(session.connection).get_all(), folder)
+    except (OSError, data_exchange.ImportError_) as error:
+        sg.popup_error(f"The export failed: {error}", title="Iceberg - export")
+        return
+    summary = ", ".join(f"{name} ({count})" for name, (_, count) in written.items())
+    session.current_console_messages = session.console_log(f"Exported to {folder}: {summary}.", session.current_console_messages)
+    sg.popup(f"Exported {len(written)} files to:\n{folder}\n\n{summary}", title="Iceberg - export complete")
+
+
+def import_transactions_csv(session, values):
+    """Validate a CSV in full, confirm, then import it (ST-010)."""
+    path = sg.popup_get_file("Select the CSV file to import", file_types=(("CSV", "*.csv"), ("All files", "*.*")), no_window=True)
+    if not path:
+        return
+    ids = account_ids(session)
+    existing = accounting.read_ledger(session.connection, session.ledger_name)
+    try:
+        preview = data_exchange.import_transactions(session.connection, session.ledger_name, path, ids, existing_rows=existing, dry_run=True)
+    except data_exchange.ImportError_ as error:
+        details = "\n".join(error.errors[:25])
+        if len(error.errors) > 25:
+            details += f"\n... and {len(error.errors) - 25} more"
+        sg.popup_scrolled(f"{error}\n\n{details}", title="Iceberg - import not possible", size=(90, 20))
+        session.current_console_messages = session.console_log(f"Import of {path} rejected: {error}", session.current_console_messages)
+        return
+    message = f"{len(preview['rows'])} transaction(s) are ready to import from\n{path}"
+    if preview['warnings']:
+        message += "\n\nWarnings:\n" + "\n".join(f"- {w}" for w in preview['warnings'][:15])
+    if sg.popup_yes_no(message + "\n\nImport them now?", title="Iceberg - confirm import") != "Yes":
+        return
+    try:
+        result = data_exchange.import_transactions(session.connection, session.ledger_name, path, ids, existing_rows=existing)
+    except data_exchange.ImportError_ as error:
+        sg.popup_error(str(error), title="Iceberg - import failed")
+        return
+    session.current_console_messages = session.console_log(f"Imported {result['imported']} transactions from {path} (ledger entries {result['transaction_ids'][0]}-{result['transaction_ids'][-1]}).", session.current_console_messages)
+    save_current_database(session, reason="Save after import")
+    show_tab(session.window, 1)
+    load_ledger_tab(session.window, values)
+
+
+WINDOW_SIZE = THEME.window_size(sg.Window.get_screen_size())
+icb_session.window = sg.Window(title="Iceberg Accounting Suite", layout= layout1, margins=(10,10), resizable=True, size=WINDOW_SIZE, finalize=True)
+try:
+    icb_session.window.set_min_size((1024, 720))
+except Exception:
+    pass
+accessibility.bind_shortcuts(icb_session.window)
+navigation.set_enabled(icb_session.window, False)
+feedback.notify(icb_session.window, THEME, "Create a database (File > New Database) or open one (Ctrl+O) to get started.", "info")
+feedback.update_save_state(icb_session.window, THEME, feedback.save_state_text(False, False, "", 0), False)
 event, values = icb_session.window.read(10)
 icb_session.console_log(f"""{icb_session.current_console_messages[0]}""",[])
+for startup_warning in STARTUP_WARNINGS:
+    icb_session.current_console_messages = icb_session.console_log(f"Startup warning - {startup_warning.title}: {startup_warning.fix}", icb_session.current_console_messages)
 
 
 icb_session.current_time_display = get_current_time_info()
@@ -2509,77 +2889,45 @@ while True:
     #window_read = window.read()
     #print(window_read)
     if event == "Exit Iceberg" or event == sg.WIN_CLOSED:
-
-        if icb_session.save_location == None or icb_session.save_location== "" or icb_session.save_location == ".":
-            icb_session.save_location = "./"
-        if icb_session.save_location[-1] != "/":
-            icb_session.save_location = icb_session.save_location + "/"
-        db.save_database(icb_session.session_log_connection,"sessions.icbs","sessions.icbskey",False)
+        if icb_session.database_loaded and icb_session.connection:
+            result = save_current_database(icb_session, reason="Save on exit")
+            if not result.ok:
+                answer = sg.popup_yes_no(
+                    "The database could not be saved. Exit anyway and lose the unsaved changes?",
+                    title="Iceberg - unsaved changes",
+                )
+                if answer != "Yes":
+                    event = "__TIMEOUT__"
+                    continue
+        save_session_log(icb_session)
         break
     event, values = icb_session.window.read(timeout=990)
+    if isinstance(event, str) and event.startswith(navigation.NAV_KEY_PREFIX):
+        event = navigation.event_for_nav_key(event)
+    if isinstance(event, str) and event in accessibility.NEEDS_DATABASE and not icb_session.database_loaded:
+        feedback.notify(icb_session.window, THEME, "Open or create a database first.", "warning")
+        event = '__TIMEOUT__'
+    if event == "New Invoice":
+        show_tab(icb_session.window, 5)
+        update_pos_view(icb_session.window, values)
+        event = "-New_Invoice_Button-"
     if event == '__TIMEOUT__':
-        #Synchronizes the time
-        if icb_session.guitimer == "Initializing": 
-            
-            print("Initializing: " + icb_session.current_time_display[0])
-            #print(icb_session.current_time_display[1][-6:-4])
-            icb_session.guitimer = int(icb_session.current_time_display[1][-6:-4])
-
-        elif icb_session.guitimer >57 or icb_session.guitimer == 0:
-
-                icb_session.synchronized = synchronize_time(icb_session.window, icb_session.current_time_display)
-                if icb_session.synchronized[0] == "No":
-                    #print(f"""Synchronizing: {timer}""")
-                    icb_session.guitimer = int(icb_session.synchronized[1][1][-6:-4])
-                else:
-                    icb_session.current_time_display = icb_session.synchronized[1]
-                    icb_session.guitimer = int(icb_session.current_time_display[1][-6:-4])
-                    icb_session.window['-Current_Time_Display-'].update(icb_session.current_time_display[0])
-                    #print(f"""Synchronized: {icb_session.current_time_display[0]}""")
-                    #print(f"""{timer}""")
-
-                    if (int("1" + icb_session.current_time_display[1][-9:-7]))%5 == 0 and icb_session.database_loaded:
-
-                        if icb_session.save_location == None or icb_session.save_location== "" or icb_session.save_location == ".":
-                            icb_session.save_location = "./"
-                        if icb_session.save_location[-1] != "/":
-                            icb_session.save_location = icb_session.save_location + "/"
-                        message, icb_session.connection = db.save_database(icb_session.connection, icb_session.db_name, icb_session.filename, icb_session.save_location)
-                        #update_dashboard_statistics(icb_session.connection, window, ledger_name, icb_session.db_name, values)
-                        icb_session.console_log(message,icb_session.current_console_messages)
-
-                    if icb_session.guitimer > 0:
-                        conditional_s = "s"
-                        if icb_session.guitimer == 1:
-                            conditional_s = ""
-                        icb_session.current_console_messages = icb_session.console_log(f"""Minute update delayed by {icb_session.guitimer} second{conditional_s}.""", icb_session.current_console_messages)
-        else:
-            current_time = get_current_time_info()
-            icb_session.guitimer = int(current_time[1][-6:-4])
-            #print(timer)
-
-
-        #todo: Autosave
-        #todo: Update employee timekeeping when active
-        #icb_session.window['-Current_Time_Display-'].update(f"""{datetime.datetime.now().month}/{datetime.datetime.now().day}/{datetime.datetime.now().year}  -  {datetime.datetime.now().hour}:{format(datetime.datetime.now().minute,'02d')}""")
-    #else:
-        #print(f"""Time Counter Counting {time_counter}""")
-        #time_counter = time_counter + 1
+        refresh_clock_and_autosave(icb_session)
+    elif tables.parse_click_event(event):
+        clicked_key, clicked_row, clicked_col = tables.parse_click_event(event)
+        if clicked_row == -1:
+            sort_table(icb_session.window, clicked_key, clicked_col)
     else:
         function_triggered = True
         if event == "Exit" or event == sg.WIN_CLOSED:
-            break
+            # Handled at the top of the loop so the database and session log are saved first.
+            event = sg.WIN_CLOSED
+            continue
         #elif event == "-Create_Database-":
         #    icb_session.filekey,icb_session.filename, icb_session.ledger_name = create_database(values, connection, current_console_messages,icb_session.window)
         #    current_console_messages = console_log(icb_session.window, f"""Filekey: {filekey}, filename: {filename}""",connection,current_console_messages)
         elif event == "Go to Dashboard":
-            this_tab_index = 0
-            for i in range(len(tab_keys)):
-                if i == this_tab_index:
-                    icb_session.window[tab_keys[i]].update(visible=True)
-                    icb_session.window[tab_keys[i]].select()
-                else:
-                    icb_session.window[tab_keys[i]].update(visible=False)
+            show_tab(icb_session.window, 0)
             update_dashboard_statistics(icb_session.window, values)
         elif event == "-Account_Type_Picker-" or event == "-Account_Year_Picker-":
             #print("Account Type Picker")
@@ -2592,19 +2940,13 @@ while True:
 
             
         elif event == "View Ledger" or event == "Search Transactions" or event == "New Transaction" or event == "-New_Transaction_Button-":
-            this_tab_index = 1
-            for i in range(len(tab_keys)):
-                if i == this_tab_index:
-                    icb_session.window[tab_keys[i]].update(visible=True)
-                    icb_session.window[tab_keys[i]].select()
-                else:
-                    icb_session.window[tab_keys[i]].update(visible=False)
+            show_tab(icb_session.window, 1)
             load_ledger_tab(icb_session.window, values)
             if event=="New Transaction" or event == "-New_Transaction_Button-":
                 this_layout, icb_session.num = new_transaction_layout(icb_session.num)
                 #print(this_layout, icb_session.num)
                 #print("this_layout")
-                new_transaction_window = sg.Window(title="Record a New Transaction", location=(700,200),layout= this_layout, margins=(10,2), resizable=True, size=(920,460))
+                new_transaction_window = sg.Window(title="Record a New Transaction", location=(700,200),layout= this_layout, margins=(10,6), resizable=True, finalize=True)
                 new_transaction_window.close_destroys_window = True
 
                 #TODO: Figure out how to update a popup window to remove an account from the list of accounts. 
@@ -2649,13 +2991,25 @@ while True:
 
 
                     elif event_newt == f"-Submit_Transaction_Button_{icb_session.num}-":
-                        if new_transaction_window[f"-Submit_Transaction_Button_{icb_session.num}-"].ButtonText == "Submit" and values_newt[f"-Transaction_Name_{icb_session.num}-"] != "" and values_newt[f"-Transaction_Date_String_{icb_session.num}-"] != "" and values_newt[f"-Transaction_Amount_{icb_session.num}-"] != "" and values_newt[f"-Transaction_Debit_Account_{icb_session.num}-"] != "" and values_newt[f"-Transaction_Credit_Account_{icb_session.num}-"] != "" and values_newt[f"-Transaction_Debit_Account_{icb_session.num}-"] != values_newt[f"-Transaction_Credit_Account_{icb_session.num}-"]:
-                            new_transaction_window[f"-Submit_Transaction_Button_{icb_session.num}-"].update("Really?")
-                        elif new_transaction_window[f"-Submit_Transaction_Button_{icb_session.num}-"].ButtonText == "Really?" and values_newt[f"-Transaction_Name_{icb_session.num}-"] != "" and values_newt[f"-Transaction_Date_String_{icb_session.num}-"] != "" and values_newt[f"-Transaction_Amount_{icb_session.num}-"] != "" and values_newt[f"-Transaction_Debit_Account_{icb_session.num}-"] != "" and values_newt[f"-Transaction_Credit_Account_{icb_session.num}-"] != "":
-
+                        checked = validation.validate_transaction(
+                            {"name": values_newt[f"-Transaction_Name_{icb_session.num}-"], "date": values_newt[f"-Transaction_Date_String_{icb_session.num}-"],
+                             "amount": values_newt[f"-Transaction_Amount_{icb_session.num}-"], "debit_account": values_newt[f"-Transaction_Debit_Account_{icb_session.num}-"],
+                             "credit_account": values_newt[f"-Transaction_Credit_Account_{icb_session.num}-"]},
+                            account_ids(icb_session), existing=accounting.read_ledger(icb_session.connection, icb_session.ledger_name))
+                        forms.show_errors(new_transaction_window, THEME, f"-Transaction_Message_{icb_session.num}-", checked, transaction_field_map(icb_session.num))
+                        if new_transaction_window[f"-Submit_Transaction_Button_{icb_session.num}-"].ButtonText == "Submit":
+                            if checked.ok and (not checked.warnings or show_validation_errors(checked, "transaction")):
+                                new_transaction_window[f"-Submit_Transaction_Button_{icb_session.num}-"].update("Really? (click again to save)")
+                            elif not checked.ok:
+                                icb_session.current_console_messages = icb_session.console_log(f"Transaction not saved: {'; '.join(checked.errors)}", icb_session.current_console_messages)
+                        elif checked.ok:
+                            values[f"-Transaction_Date_String_{icb_session.num}-"] = checked.cleaned['date']
+                            values[f"-Transaction_Amount_{icb_session.num}-"] = f"{checked.cleaned['amount'] / 100:.2f}"
                             add_transaction_to_database(values)
                             icb_session.transaction = load_ledger_tab(icb_session.window,values)
                             new_transaction_window.close()
+                        else:
+                            new_transaction_window[f"-Submit_Transaction_Button_{icb_session.num}-"].update("Submit")
 
                 #new_transaction_window.close()
         elif event == "Open Database":    
@@ -2664,43 +3018,20 @@ while True:
             #print(this_layout, icb_session.num)
             new_database_window = sg.Window(title="Open a Database", location=(900,500),layout= this_layout, margins=(10,10), resizable=True, size=(480,120))
             event_opendb, values_opendb = new_database_window.read(close=True)
-            values.update(values_opendb)
-            if event_opendb == f"-Open_Database_Button_{icb_session.num}-": 
-                icb_session.connection = False
-                fileloc = str(values[f"-Open_File_{icb_session.num}-"])
-                db_name_0 = fileloc[:-3]
-                icb_session.filekey=""
-                filename_0 = fileloc
-                
-                
-                remove_to = filename_0[::-1].index("/")
-                #print("1042")
-                icb_session.filename = filename_0[-remove_to:]
-
-                #print(f"1053 filename: {icb_session.filename}")
-
-
-                remove_to = db_name_0[::-1].index("/")
-                #print("1042")
-                icb_session.db_name = db_name_0[-remove_to:]
-                #icb_session.ledger_name = f"tbl_ledger_{icb_session.db_name[:-4]}_CY{values['-Year_Picker-']}" #Comment out the year picker
-                #print(icb_session.db_name)
-
-                icb_session.database_loaded = True
-                icb_session.save_location = db_name_0[:-remove_to]
-                if icb_session.save_location == None or icb_session.save_location== "" or icb_session.save_location == ".":
-                    icb_session.save_location = "./"
-                if icb_session.save_location[-1] != "/":
-                    icb_session.save_location = icb_session.save_location + "/"
-                #print(f"1044 {icb_session.filekey} {icb_session.db_name}; {icb_session.save_location}")
-                with open(f"{icb_session.save_location}{icb_session.filename}",'rb') as file:
-                    icb_session.filekey = file.read()
-                #print(f"1049 filekey: {icb_session.filekey}; db_name: {icb_session.db_name}; save_location: {icb_session.save_location}")
-                icb_session.connection, icb_session.filekey = db.open_database(icb_session.filename, icb_session.db_name, icb_session.save_location)
-                
+            if values_opendb:
+                values.update(values_opendb)
+            fileloc = str(values.get(f"-Open_File_{icb_session.num}-", "") or "")
+            opened = False
+            if event_opendb == f"-Open_Database_Button_{icb_session.num}-":
+                if fileloc.lower().endswith(".icbkey"):
+                    opened = open_database_from_key(icb_session, fileloc)
+                else:
+                    icb_session.current_console_messages = icb_session.console_log("Open Database: no filekey (.icbkey) was selected.", icb_session.current_console_messages)
+            if opened:
                 #Load the database properties
                 property_repo = PropertyRepository(icb_session.connection)
                 icb_session.ledger_name = property_repo.get('Ledger Name') or ""
+                prepare_schema(icb_session)
                 #Log to console
                 icb_session.current_console_messages = icb_session.console_log(f"Filekey Read: {icb_session.filename}", icb_session.current_console_messages)
                 icb_session.current_console_messages = icb_session.console_log(f"Database Opened: {icb_session.db_name}", icb_session.current_console_messages)
@@ -2724,13 +3055,7 @@ while True:
 
 
                 #Switch to the dashboard and update statistics
-                this_tab_index = 0
-                for i in range(len(tab_keys)):
-                    if i == this_tab_index:
-                        icb_session.window[tab_keys[i]].update(visible=True)
-                        icb_session.window[tab_keys[i]].select()
-                    else:
-                        icb_session.window[tab_keys[i]].update(visible=False)                
+                show_tab(icb_session.window, 0)
                 
                 
                 
@@ -2751,23 +3076,8 @@ while True:
             search_ledger(icb_session.window,values)
         elif event == "-Save_Revised_Properties-":
             update_database_properties(icb_session.window,values)
-        elif event == "Profit and Loss":
-            this_tab_index = 2
-            for i in range(len(tab_keys)):
-                if i == this_tab_index:
-                    icb_session.window[tab_keys[i]].update(visible=True)
-                    icb_session.window[tab_keys[i]].select()
-                else:
-                    icb_session.window[tab_keys[i]].update(visible=False)
-            
         elif event == "View Vendors" or event=="New Vendor" or event == f"-New_Vendor_Button-":
-            this_tab_index = 3
-            for i in range(len(tab_keys)):
-                if i == this_tab_index:
-                    icb_session.window[tab_keys[i]].update(visible=True)
-                    icb_session.window[tab_keys[i]].select()
-                else:
-                    icb_session.window[tab_keys[i]].update(visible=False)
+            show_tab(icb_session.window, 3)
             if event == "View Vendors" or event=="New Vendor":
                 load_vendors_tab(icb_session.window,values)
             if event=="New Vendor" or event == f"-New_Vendor_Button-":
@@ -2789,8 +3099,13 @@ while True:
                     #values.update(values_newv)  
                     if event_newv == sg.WIN_CLOSED:
                         break      
-                    if event_newv == f"-Submit_Vendor_Button_{icb_session.num}-" and values_newv[f"-Vendor_Name_{icb_session.num}-"] != "":
-                        print(f"""Adding {values_newv[f'-Vendor_Name_{icb_session.num}-']}""")
+                    if event_newv == f"-Submit_Vendor_Button_{icb_session.num}-":
+                        checked = validation.validate_vendor(
+                            {"name": values_newv[f"-Vendor_Name_{icb_session.num}-"], "email": values_newv[f"-Vendor_Email_{icb_session.num}-"]},
+                            [v['Business_Name'] for v in VendorRepository(icb_session.connection).get_all()])
+                        forms.show_errors(new_vendor_window, THEME, f"-Vendor_Message_{icb_session.num}-", checked, {"name": f"-Vendor_Name_{icb_session.num}-", "email": f"-Vendor_Email_{icb_session.num}-"})
+                        if not show_validation_errors(checked, "vendor"):
+                            continue
                         add_vendor_to_database(icb_session.window,values_newv)
                         load_vendors_tab(icb_session.window,values)
                         new_vendor_window.close()
@@ -2801,13 +3116,7 @@ while True:
             if len(this_index) > 0:
                 load_single_vendor(icb_session.window, values, icb_session.vendors[this_index[0]])          
         elif event == "View Customers" or event == "New Customer" or event == f"-New_Customer_Button-":
-            this_tab_index = 4
-            for i in range(len(tab_keys)):
-                if i == this_tab_index:
-                    icb_session.window[tab_keys[i]].update(visible=True)
-                    icb_session.window[tab_keys[i]].select()
-                else:
-                    icb_session.window[tab_keys[i]].update(visible=False)
+            show_tab(icb_session.window, 4)
             update_customers_view(icb_session.window,values)
             if event == "New Customer" or event == f"-New_Customer_Button-":
                 customer_repo = CustomerRepository(icb_session.connection)
@@ -2828,8 +3137,15 @@ while True:
                     #values.extend(values_newc)    ]
                     if event_newc == sg.WIN_CLOSED:
                         break  
-                    elif event_newc == f"-Submit_Customer_Button_{icb_session.num}-" and values_newc[f"-Customer_Address_{icb_session.num}-"] != '':
-                        print(f"""Adding {values_newc[f'-Customer_Name_{icb_session.num}-']}""")
+                    elif event_newc == f"-Submit_Customer_Button_{icb_session.num}-":
+                        checked = validation.validate_customer(
+                            {"company": values_newc[f"-Customer_Name_{icb_session.num}-"], "first_name": values_newc[f"-Customer_Contact_First_{icb_session.num}-"],
+                             "last_name": values_newc[f"-Customer_Contact_Last_{icb_session.num}-"], "address": values_newc[f"-Customer_Address_{icb_session.num}-"],
+                             "email": values_newc[f"-Customer_Email_{icb_session.num}-"]},
+                            CustomerRepository(icb_session.connection).search(""))
+                        forms.show_errors(new_customer_window, THEME, f"-Customer_Message_{icb_session.num}-", checked, {"company": f"-Customer_Name_{icb_session.num}-", "address": f"-Customer_Address_{icb_session.num}-", "email": f"-Customer_Email_{icb_session.num}-"})
+                        if not show_validation_errors(checked, "customer"):
+                            continue
                         add_customer_to_database(icb_session.window,values_newc)    
                         #print("Added customer")
                         update_customers_view(icb_session.window,values)
@@ -2864,32 +3180,14 @@ while True:
             if len(this_index) > 0:
                 load_single_customer(icb_session.window, values, icb_session.customers[this_index[0]])   
         elif event == "Point of Sale":
-            this_tab_index = 5
-            for i in range(len(tab_keys)):
-                if i == this_tab_index:
-                    icb_session.window[tab_keys[i]].update(visible=True)
-                    icb_session.window[tab_keys[i]].select()
-                else:
-                    icb_session.window[tab_keys[i]].update(visible=False)
+            show_tab(icb_session.window, 5)
             update_pos_view(icb_session.window,values)
         elif event == "-POS_Search_Input-":
             update_pos_view(icb_session.window,values)
         elif event == "View Inventory":
-            this_tab_index = 6
-            for i in range(len(tab_keys)):
-                if i == this_tab_index:
-                    icb_session.window[tab_keys[i]].update(visible=True)
-                    icb_session.window[tab_keys[i]].select()
-                else:
-                    icb_session.window[tab_keys[i]].update(visible=False)
+            show_tab(icb_session.window, 6)
         elif event == "Equity Dashboard":
-            this_tab_index = 7
-            for i in range(len(tab_keys)):
-                if i == this_tab_index:
-                    icb_session.window[tab_keys[i]].update(visible=True)
-                    icb_session.window[tab_keys[i]].select()
-                else:
-                    icb_session.window[tab_keys[i]].update(visible=False)
+            show_tab(icb_session.window, 7)
         elif event == "New Database":
             
             this_layout, icb_session.num = new_database_layout(icb_session.num)
@@ -2902,7 +3200,15 @@ while True:
                     values.update(values_newdb)
                 if event_newdb == sg.WIN_CLOSED:
                     break
-                elif event_newdb == f"-Submit_New_Database_Button_{icb_session.num}-" and values_newdb[f"-db_name_{icb_session.num}-"] != "" and values_newdb[f"-Business_Address_{icb_session.num}-"] != "" and values_newdb[f"-Save_Location_{icb_session.num}-"] != "" and values_newdb[f"-Business_Receipts_Repository_{icb_session.num}-"] != "" and values_newdb[f'-Business_SalesTax_{icb_session.num}-'] != "": 
+                elif event_newdb == f"-Submit_New_Database_Button_{icb_session.num}-":
+                    stem = validation.database_file_stem(values_newdb[f"-db_name_{icb_session.num}-"])
+                    checked = validation.validate_database_properties(
+                        {"business_name": values_newdb[f"-db_name_{icb_session.num}-"], "address": values_newdb[f"-Business_Address_{icb_session.num}-"],
+                         "sales_tax": values_newdb[f'-Business_SalesTax_{icb_session.num}-'], "save_location": values_newdb[f"-Save_Location_{icb_session.num}-"],
+                         "receipts_location": values_newdb[f"-Business_Receipts_Repository_{icb_session.num}-"]},
+                        new_database=True, existing_file=f"./{stem}.icb" if stem else None)
+                    if not show_validation_errors(checked, "new database"):
+                        continue
                     icb_session.connection = False
                     icb_session.filekey, icb_session.filename,  chart_of_accounts_display_content = create_database(values, icb_session.current_console_messages, icb_session.window, icb_session.num, current_year)
                     #print(ledger_name)
@@ -2910,7 +3216,6 @@ while True:
                         icb_session.current_console_messages = icb_session.console_log(f"Database created: {icb_session.db_name}", icb_session.current_console_messages)
                         icb_session.current_console_messages = icb_session.console_log(f"Filekey created: {icb_session.filename}", icb_session.current_console_messages)
                         icb_session.current_console_messages = icb_session.console_log("Dashboard statistics updated.", icb_session.current_console_messages)
-                        icb_session.guitimer = "Initializing"
                         #Test to toggle menu items enabled/disabled
                         #print(menu_def[0][1])
                         #menu_def[0][1][3] = "Save Database &As"
@@ -2922,15 +3227,58 @@ while True:
         #elif event == "-Year_Picker-": 
         #    icb_session.window, chart_of_accounts_display_content = update_dashboard_statistics(icb_session.window, values)
 
-        elif event == "Save Database":    
-                if icb_session.save_location == None or icb_session.save_location== "" or icb_session.save_location == ".":
-                    icb_session.save_location = "./"
-                if icb_session.save_location[-1] != "/":
-                    icb_session.save_location = icb_session.save_location + "/"
-                message, icb_session.connection = db.save_database(icb_session.connection, icb_session.db_name, icb_session.filename, icb_session.save_location)
-                #update_dashboard_statistics(icb_session.connection, window, ledger_name, icb_session.db_name, values)
-                icb_session.current_console_messages = icb_session.console_log(message, icb_session.current_console_messages)
-                #current_console_messages = console_log(window, "Dashboard statistics updated.", current_console_messages)
+        elif event == "Save Database":
+                save_current_database(icb_session, reason="Manual save")
+        elif event == "Reports":
+            show_tab(icb_session.window, 2)
+        elif event == "Focus Search":
+            focus_search_box(icb_session)
+        elif event == "Keyboard Shortcuts":
+            sg.popup_scrolled(accessibility.shortcut_help_text(), title="Keyboard shortcuts", font=THEME.font("medium", mono=True), size=(70, 24))
+        elif event == "Preferences":
+            show_preferences_dialog(icb_session)
+        elif event in ("Income Statement", "Income Statement by Month", "Balance Sheet", "Cash Flow"):
+            if icb_session.connection:
+                show_tab(icb_session.window, 2)
+                apply_report_period(icb_session, values)
+                run_report(icb_session, values, report_type=event)
+        elif event == "-Report_Period-":
+            apply_report_period(icb_session, values)
+        elif event == "-Report_Type-":
+            pass
+        elif event == "-Run_Report-":
+            run_report(icb_session, values)
+        elif event == "-Export_Report-":
+            export_report_csv(icb_session)
+        elif event == "Export All Data to CSV":
+            if icb_session.connection:
+                export_all_csv(icb_session)
+        elif event == "Export Ledger to CSV":
+            if icb_session.connection:
+                export_ledger_csv(icb_session)
+        elif event == "Import Transactions from CSV":
+            if icb_session.connection:
+                import_transactions_csv(icb_session, values)
+        elif event == "Reconcile Account":
+            open_reconcile_tab(icb_session, values)
+        elif event == "-Reconcile_Button-":
+            current_account = icb_session.account_number['Account_ID'] if isinstance(icb_session.account_number, dict) else None
+            open_reconcile_tab(icb_session, values, account_id=current_account)
+        elif event == "-Reconcile_Load-":
+            if icb_session.connection:
+                load_reconciliation(icb_session, values)
+        elif event == "-Reconcile_List-":
+            update_reconciliation_summary(icb_session, selected_reconcile_ids(icb_session, values))
+        elif event == "-Reconcile_Finish-":
+            finish_reconciliation(icb_session, values)
+        elif event == "-Reconcile_Undo-":
+            if icb_session.connection:
+                undo_reconciliation(icb_session, values)
+        elif event == "-Reconcile_History-":
+            if icb_session.connection:
+                show_reconciliation_history(icb_session, values)
+        elif event == "Restore from Backup":
+                restore_database_from_backup(icb_session, values)
         elif event == "-Transaction_Image_Button-":
             try:
                 subprocess.call(["xdg-open",f"{icb_session.window['-Transaction_Image_Button-'].ButtonText}"]) #linux
@@ -2941,30 +3289,16 @@ while True:
         elif event == "-View_Account_Button-":# or event == "-Chart_of_Accounts_Content-":
             if icb_session.connection:
                 account_index = values["-Chart_of_Accounts_Content-"]
-                #print(account_index[0])
-                window, chart_of_accounts_display_content = update_dashboard_statistics(icb_session.window, values)
-                #print(chart_of_accounts_display_content)
+                chart_of_accounts_display_content = icb_session.chart_rows or update_dashboard_statistics(icb_session.window, values)[1]
                 try:
                     account_number = chart_of_accounts_display_content[account_index[0]][0]
-                    this_tab_index = 8
-                    for i in range(len(tab_keys)):
-                        if i == this_tab_index:
-                            icb_session.window[tab_keys[i]].update(visible=True)
-                            icb_session.window[tab_keys[i]].select()
-                        else:
-                            icb_session.window[tab_keys[i]].update(visible=False)
+                    show_tab(icb_session.window, 8)
                     icb_session.window, values = load_view_account_tab(icb_session.window, values, account_number, icb_session.ledger_name)
                 except:
                     pass
 
         elif event == "Database Properties":
-            this_tab_index = 9
-            for i in range(len(tab_keys)):
-                if i == this_tab_index:
-                    icb_session.window[tab_keys[i]].update(visible=True)
-                    icb_session.window[tab_keys[i]].select()
-                else:
-                    icb_session.window[tab_keys[i]].update(visible=False)
+            show_tab(icb_session.window, 9)
             load_database_properties_tab(icb_session.window, values, icb_session.connection)
         elif event == "-Edit_Vendor_Button-":
             if icb_session.window["-Edit_Vendor_Button-"].ButtonText == "Edit Vendor" and values['-Vendor_Name_Input-'] != '':
@@ -3052,21 +3386,9 @@ while True:
             except:
                 subprocess.call(["README.pdf"],shell=True) #windows
         elif event == "About":
-            this_tab_index = 11
-            for i in range(len(tab_keys)):
-                if i == this_tab_index:
-                    icb_session.window[tab_keys[i]].update(visible=True)
-                    icb_session.window[tab_keys[i]].select()
-                else:
-                    icb_session.window[tab_keys[i]].update(visible=False)            
+            show_tab(icb_session.window, 11)
         elif event == "View Services" or event == "New Service" or event == "-New_Service_Button-" or event == '-Services_Search_Input-':
-            this_tab_index = 10
-            for i in range(len(tab_keys)):
-                if i == this_tab_index:
-                    icb_session.window[tab_keys[i]].update(visible=True)
-                    icb_session.window[tab_keys[i]].select()
-                else:
-                    icb_session.window[tab_keys[i]].update(visible=False)
+            show_tab(icb_session.window, 10)
             load_services_tab(icb_session.window, values)   
             if event == "New Service" or event == "-New_Service_Button-":
                 sku_repo = SkuRepository(icb_session.connection)
@@ -3088,8 +3410,14 @@ while True:
                     #values.extend(values_news)      
                     if event_news == sg.WIN_CLOSED:
                         break
-                    elif event_news == f"-Submit_Service_Button_{icb_session.num}-" and values_news[f"-Service_Description_{icb_session.num}-"] != "" and values_news[f"-Service_Price_{icb_session.num}-"] and values_news[f"-Service_Taxable_{icb_session.num}-"] != "":
-                        print(f"""Adding {values_news[f'-Service_Description_{icb_session.num}-']}""")
+                    elif event_news == f"-Submit_Service_Button_{icb_session.num}-":
+                        checked = validation.validate_service(
+                            {"description": values_news[f"-Service_Description_{icb_session.num}-"], "price": values_news[f"-Service_Price_{icb_session.num}-"],
+                             "taxable": values_news[f"-Service_Taxable_{icb_session.num}-"]},
+                            [sku['Description'] for sku in SkuRepository(icb_session.connection).search("")])
+                        forms.show_errors(new_service_window, THEME, f"-Service_Message_{icb_session.num}-", checked, {"description": f"-Service_Description_{icb_session.num}-", "price": f"-Service_Price_{icb_session.num}-"})
+                        if not show_validation_errors(checked, "service"):
+                            continue
                         add_service_to_database(icb_session.window,values_news)    
                         #print("Added customer")
                         load_services_tab(icb_session.window,values) 
@@ -3121,7 +3449,7 @@ while True:
                 icb_session.window['-Edit_Account_Bank_Acct_Type-'].update(disabled=True)
                 icb_session.window['-Account_Notes_Display-'].update(disabled=True, background_color=detailed_information_color)
                 save_account_changes(icb_session.window, values)
-                icb_session.current_console_messages = icb_session.console_log(db.save_database(icb_session.connection,icb_session.db_name,icb_session.filename,icb_session.save_location),icb_session.current_console_messages)
+                save_current_database(icb_session, reason="Save after account edit")
         elif event == "-New_Account_Button-":
             if icb_session.connection:
                 this_layout, icb_session.num = new_account_layout(icb_session.num)
@@ -3135,7 +3463,13 @@ while True:
                         break
                     elif event_newacc == f"-Account_Type_Picker_{icb_session.num}-":
                         pass
-                    elif event_newacc == f"-Submit_Account_Button_{icb_session.num}-" and values_newacc[f"-Account_Name_{icb_session.num}-"] != "":        
+                    elif event_newacc == f"-Submit_Account_Button_{icb_session.num}-":
+                        checked = validation.validate_account(values_newacc[f"-Account_Name_{icb_session.num}-"],
+                                                              [a['Name'] for a in AccountRepository(icb_session.connection).get_all()],
+                                                              values_newacc[f"-Account_Type_Picker_{icb_session.num}-"])
+                        forms.show_errors(new_account_window, THEME, f"-Account_Message_{icb_session.num}-", checked, {"name": f"-Account_Name_{icb_session.num}-"})
+                        if not show_validation_errors(checked, "account"):
+                            continue
                         added_account = add_account_to_database(values)     
                         icb_session.current_console_messages = icb_session.console_log(f"New Account Created: {added_account}",icb_session.current_console_messages)
                         new_account_window.close()
@@ -3201,9 +3535,13 @@ while True:
                         icb_session.these_skus.append([f"{sku['Sku']}",f"{sku['Description']}",f"{format_currency(int(sku['Price']))}",f"{sku['Taxable']}"])
                     new_invoice_window[f'-Invoice_Search_Content_{icb_session.num}-'].update(icb_session.these_skus)                    
                 elif event_newi == f"-Invoice_Add_Button_{icb_session.num}-":
-                    if values[f"-Invoice_Quantity_Input_{icb_session.num}-"] != "":
+                    checked = validation.validate_line_item(values_newi[f"-Invoice_Quantity_Input_{icb_session.num}-"],
+                                                            sku_selected=bool(values_newi[f"-Invoice_Search_Content_{icb_session.num}-"]))
+                    if checked.ok and len(icb_session.these_line_items) >= validation.MAX_LINE_ITEMS:
+                        checked.add_error(f"An invoice can have at most {validation.MAX_LINE_ITEMS} line items.")
+                    if show_validation_errors(checked, "line item"):
                         try:
-                            quantity = dec(values_newi[f"-Invoice_Quantity_Input_{icb_session.num}-"])
+                            quantity = checked.cleaned['quantity']
                             this_sku_index = values_newi[f"-Invoice_Search_Content_{icb_session.num}-"]
                             #print(f"""{this_sku_index[0]}""")
                             this_sku_id = icb_session.these_skus[this_sku_index[0]][0]
@@ -3230,11 +3568,21 @@ while True:
                         new_invoice_window[f'-Invoice_Line_Items_{icb_session.num}-'].update(icb_session.these_line_items)
                         populate_invoice_totals(new_invoice_window, values_newi)
                 elif event_newi == f"-Submit_Invoice_Button_{icb_session.num}-":
-                    if new_invoice_window[f"-Submit_Invoice_Button_{icb_session.num}-"].ButtonText == "Submit" and values_newi[f"-Invoice_Customer_Address_{icb_session.num}-"] != "" and values_newi[f"-Invoice_Status_{icb_session.num}-"] != "" and values_newi[f"-Invoice_Due_Date_{icb_session.num}-"] != "" and icb_session.these_line_items != [] and values_newi[f"-Invoice_SalesTax_{icb_session.num}-"] != "" and values_newi[f"-Invoice_Subtotal_{icb_session.num}-"] != "$0.00" and values_newi[f"-Invoice_Total_{icb_session.num}-"] != "$0.00" and values_newi[f"-Invoice_Debit_{icb_session.num}-"] != "":
-                        new_invoice_window[f"-Submit_Invoice_Button_{icb_session.num}-"].update("Really?")
-                    elif new_invoice_window[f"-Submit_Invoice_Button_{icb_session.num}-"].ButtonText == "Really?" and values_newi[f"-Invoice_Customer_Address_{icb_session.num}-"] != "" and values_newi[f"-Invoice_Status_{icb_session.num}-"] != "" and values_newi[f"-Invoice_Due_Date_{icb_session.num}-"] != "" and icb_session.these_line_items != [] and values_newi[f"-Invoice_SalesTax_{icb_session.num}-"] != "" and values_newi[f"-Invoice_Subtotal_{icb_session.num}-"] != "$0.00" and values_newi[f"-Invoice_Total_{icb_session.num}-"] != "$0.00" and values_newi[f"-Invoice_Debit_{icb_session.num}-"] != "":
-                        
-                        
+                    selected_customer = values_newi[f"-Invoice_Customers_Results_{icb_session.num}-"]
+                    checked = validation.validate_invoice(
+                        {"customer_id": icb_session.these_customers[selected_customer[0]][0] if selected_customer else "",
+                         "status": values_newi[f"-Invoice_Status_{icb_session.num}-"], "due_date": values_newi[f"-Invoice_Due_Date_{icb_session.num}-"],
+                         "deposit_account": values_newi[f"-Invoice_Debit_{icb_session.num}-"]},
+                        icb_session.these_line_items,
+                        asset_account_ids=[a['Account_ID'] for a in AccountRepository(icb_session.connection).get_by_type_prefix('10')])
+                    if new_invoice_window[f"-Submit_Invoice_Button_{icb_session.num}-"].ButtonText == "Submit":
+                        if show_validation_errors(checked, "invoice"):
+                            new_invoice_window[f"-Submit_Invoice_Button_{icb_session.num}-"].update("Really?")
+                    elif not checked.ok:
+                        new_invoice_window[f"-Submit_Invoice_Button_{icb_session.num}-"].update("Submit")
+                        show_validation_errors(checked, "invoice")
+                    else:
+                        values_newi[f"-Invoice_Due_Date_{icb_session.num}-"] = checked.cleaned['due_date']
                         icb_session.transaction_debit_account = values_newi[f"-Invoice_Debit_{icb_session.num}-"][:5]
                         icb_session.this_invoice["Invoice_ID"] = f"{this_invoice_id}"
                         icb_session.this_invoice["Line_Items"] = icb_session.these_line_items
@@ -3253,7 +3601,7 @@ while True:
                         icb_session.this_invoice["Status"] = values_newi[f"-Invoice_Status_{icb_session.num}-"]
                         icb_session.this_invoice["Customer_ID"] = icb_session.these_customers[values_newi[f"-Invoice_Customers_Results_{icb_session.num}-"][0]][0]
                         icb_session.this_invoice['Tracking_Code'] = id_generator()
-                        invoice_date = current_date
+                        invoice_date = iceberg_time.local_date_string()
                         filepath = generate_new_invoice(new_invoice_window, values_newi, invoice_date)
                         icb_session.this_invoice["Location"] = filepath
                         save_invoice_to_database(new_invoice_window, values_newi, filepath)
@@ -3283,224 +3631,8 @@ while True:
             elif icb_session.window['-Edit_POS_Button-'].ButtonText == "Save Changes" and values['-POS_Status_Input-'] != "":
                 icb_session.window['-POS_Status_Input-'].update(disabled=True)
                 icb_session.window['-Edit_POS_Button-'].update("Edit Invoice")
-                invoice_id = values['-POS_Number_Display-'][8:]
-                invoice_repo = InvoiceRepository(icb_session.connection)
-                icb_session.this_invoice = invoice_repo.get_by_id(invoice_id)                   
-                #print(f"line 3365 status {icb_session.this_invoice['Status']}")
-                if values['-POS_Status_Input-'] == "Overdue" and icb_session.this_invoice['Status'] == 'Due':
-
-                    invoice_repo.update(invoice_id=invoice_id, status='Overdue', edited_time=icb_session.current_time_display[0])
-                    icb_session.this_invoice['Status'] = 'Overdue'
-                    #print(icb_session.this_invoice)
-
-
-                    invoice_date = f"{icb_session.this_invoice['Created_Time'].replace('Monday, ','')}"
-                    invoice_date = f"{invoice_date.replace('Tuesday, ','')}"
-                    invoice_date = f"{invoice_date.replace('Wednesday, ','')}"
-                    invoice_date = f"{invoice_date.replace('Thursday, ','')}"
-                    invoice_date = f"{invoice_date.replace('Friday, ','')}"
-                    invoice_date = f"{invoice_date.replace('Saturday, ','')}"
-                    invoice_date = f"{invoice_date.replace('Sunday, ','')}"
-
-                    search=re.search(r" ",invoice_date)
-                    invoice_date = invoice_date[:search.start()]
-                    icb_session.these_line_items = ast.literal_eval(icb_session.this_invoice['Line_Items'])
-                    filepath = generate_new_invoice(icb_session.window,values,invoice_date)
-                    update_pos_view(icb_session.window,values)
-
-                elif values['-POS_Status_Input-'] == "Paid" and icb_session.this_invoice['Status'] == 'Due' or values['-POS_Status_Input-'] == "Paid" and icb_session.this_invoice['Status'] == 'Overdue':
-                    
-                    invoice_id = values['-POS_Number_Display-']
-                    #print(invoice_id)
-                    check_paid_query = f"""SELECT Transaction_ID from {icb_session.ledger_name} WHERE Name LIKE '{invoice_id}%' AND Debit_Acct IS NOT '10006';"""
-                    paid_transactions = db.execute_read_query_dict(icb_session.connection,check_paid_query)
-
-                    invoice_repo = InvoiceRepository(icb_session.connection)
-                    icb_session.this_invoice = invoice_repo.get_by_id(invoice_id[8:])
-                    icb_session.this_invoice['Status'] = values['-POS_Status_Input-']
-                    icb_session.this_invoice['Due_Date'] = f"{current_date}"
-                    #print(icb_session.this_invoice['Line_Items'])
-                    icb_session.these_line_items = ast.literal_eval(icb_session.this_invoice['Line_Items'])
-                    #print(icb_session.these_line_items)
-                    if paid_transactions == []:
-                        invoice_layout, icb_session.num = invoice_paid_layout(icb_session.num)
-                        payment_account_window = sg.Window(title=f"Select Deposit Account", location=(700,200),layout= invoice_layout, margins=(10,2), resizable=True, size=(350,200))
-                        payment_account_window.close_destroys_window = True
-                        #Save the transaction 
-                        while True:
-                            event_invoice, values_invoice = payment_account_window.read(close=False)
-                            if values_invoice == sg.WIN_CLOSED:
-                                break
-                            if event_invoice == f'-Invoice_Transactions_Button_{icb_session.num}-':
-                                
-                                count_transactions_query = f"""SELECT COUNT(*) FROM {icb_session.ledger_name};"""
-                                transactions_count = db.execute_read_query_dict(icb_session.connection,count_transactions_query)
-                                #print(transactions_count)
-                                
-                                this_invoice_subtotal = int(icb_session.this_invoice['Subtotal'])
-                                accounts_receivable_transaction = int(transactions_count[0]['COUNT(*)'])+1
-                                add_transaction_query = f"""INSERT INTO {icb_session.ledger_name} (Transaction_ID, Credit_Acct, Debit_Acct, Amount, Name, Notes, Created_Time, 
-                                Edited_Time, Transaction_Date, Record_Image, Vendor, Customer) VALUES ('{accounts_receivable_transaction}',
-                                '10006','{values_invoice[f'-Invoice_Debit_Acct_{icb_session.num}-'][:5]}', '{this_invoice_subtotal}', 'Invoice {icb_session.this_invoice['Invoice_ID']} Paid', 
-                                '{icb_session.this_invoice['Tracking_Code']}', '{icb_session.current_time_display[0]}', '{icb_session.current_time_display[0]}', '{f"{now}"[:10]}', '{icb_session.this_invoice['Location']}', '', 
-                                '{icb_session.this_invoice['Customer_ID']}');"""
-                                added_transaction = db.execute_query(icb_session.connection, add_transaction_query)
-                                print(f"added_transaction: {added_transaction}")
-
-                                this_invoice_sales_tax = int(icb_session.this_invoice['Sales_Tax'])
-                                add_transaction_query = f"""INSERT INTO {icb_session.ledger_name} (Transaction_ID, Credit_Acct, Debit_Acct, Amount, Name, Notes, Created_Time, 
-                                Edited_Time, Transaction_Date, Record_Image, Vendor, Customer) VALUES ('{accounts_receivable_transaction+1}',
-                                '10006','{values_invoice[f'-Invoice_Debit_Acct_{icb_session.num}-'][:5]}', '{this_invoice_sales_tax}', 'Invoice {icb_session.this_invoice['Invoice_ID']} Sales Tax Payable', 
-                                '{icb_session.this_invoice['Tracking_Code']}', '{icb_session.current_time_display[0]}', '{icb_session.current_time_display[0]}', '{f"{now}"[:10]}', '{icb_session.this_invoice['Location']}', '', 
-                                '{icb_session.this_invoice['Customer_ID']}');"""
-                                added_transaction = db.execute_query(icb_session.connection, add_transaction_query)
-                                print(f"added_transaction: {added_transaction}")
-
-                                #update the invoice
-                                #update the invoice
-                                invoice_repo.update(invoice_id=icb_session.this_invoice['Invoice_ID'], status=values[f'-POS_Status_Input-'], edited_time=icb_session.current_time_display[0])
-                                update_pos_view(icb_session.window,values)
-                                invoice_date = f"{icb_session.this_invoice['Created_Time'].replace('Monday, ','')}"
-                                invoice_date = f"{invoice_date.replace('Tuesday, ','')}"
-                                invoice_date = f"{invoice_date.replace('Wednesday, ','')}"
-                                invoice_date = f"{invoice_date.replace('Thursday, ','')}"
-                                invoice_date = f"{invoice_date.replace('Friday, ','')}"
-                                invoice_date = f"{invoice_date.replace('Saturday, ','')}"
-                                invoice_date = f"{invoice_date.replace('Sunday, ','')}"
-                                search=re.search(r" ",invoice_date)
-                                invoice_date = invoice_date[:search.start()]
-                                generate_new_invoice(icb_session.window,values, invoice_date)
-                                payment_account_window.close()
-                elif values['-POS_Status_Input-'] == "Refunded" and icb_session.this_invoice['Status'] == 'Paid':
-                    
-                    invoice_id = values['-POS_Number_Display-']
-                    #print(invoice_id)
-                    check_paid_query = f"""SELECT Transaction_ID from {icb_session.ledger_name} WHERE Name Like '{invoice_id}%' AND Debit_Acct IS NOT '10006';"""
-                    paid_transactions = db.execute_read_query_dict(icb_session.connection,check_paid_query)
-                    invoice_repo = InvoiceRepository(icb_session.connection)
-                    icb_session.this_invoice = invoice_repo.get_by_id(invoice_id[8:])
-                    change_status = icb_session.this_invoice['Status']
-                    icb_session.this_invoice['Status'] = values['-POS_Status_Input-']
-                    icb_session.this_invoice['Due_Date'] = f"{current_date}"
-                    #print(icb_session.this_invoice['Line_Items'])
-                    icb_session.these_line_items = ast.literal_eval(icb_session.this_invoice['Line_Items'])
-                    #print(icb_session.these_line_items)
-                    if paid_transactions != [] and change_status != "Refunded":
-                        invoice_layout, icb_session.num = invoice_paid_layout(icb_session.num)
-                        payment_account_window = sg.Window(title=f"Select Credit Account", location=(700,200),layout= invoice_layout, margins=(10,2), resizable=True, size=(350,200))
-                        payment_account_window.close_destroys_window = True
-                        #Save the transaction 
-                        while True:
-                            event_invoice, values_invoice = payment_account_window.read(close=False)
-                            if values_invoice == sg.WIN_CLOSED:
-                                break
-                            if event_invoice == f'-Invoice_Transactions_Button_{icb_session.num}-':
-                                
-                                count_transactions_query = f"""SELECT COUNT(*) FROM {icb_session.ledger_name};"""
-                                transactions_count = db.execute_read_query_dict(icb_session.connection,count_transactions_query)
-                                #print(transactions_count)
-                                
-                                this_invoice_subtotal = int(icb_session.this_invoice['Subtotal'])
-                                accounts_receivable_transaction = int(transactions_count[0]['COUNT(*)'])+1
-                                add_transaction_query = f"""INSERT INTO {icb_session.ledger_name} (Transaction_ID, Credit_Acct, Debit_Acct, Amount, Name, Notes, Created_Time, 
-                                Edited_Time, Transaction_Date, Record_Image, Vendor, Customer) VALUES ('{accounts_receivable_transaction}',
-                                '{values_invoice[f'-Invoice_Debit_Acct_{icb_session.num}-'][:5]}','15001', '{this_invoice_subtotal}', 'Invoice {icb_session.this_invoice['Invoice_ID']} Refunded', 
-                                '{icb_session.this_invoice['Tracking_Code']}', '{icb_session.current_time_display[0]}', '{icb_session.current_time_display[0]}', '{f"{now}"[:10]}', '{icb_session.this_invoice['Location']}', '', 
-                                '{icb_session.this_invoice['Customer_ID']}');"""
-                                added_transaction = db.execute_query(icb_session.connection, add_transaction_query)
-                                print(f"added_transaction: {added_transaction}")
-
-                                this_invoice_sales_tax = int(icb_session.this_invoice['Sales_Tax'])
-                                add_transaction_query = f"""INSERT INTO {icb_session.ledger_name} (Transaction_ID, Credit_Acct, Debit_Acct, Amount, Name, Notes, Created_Time, 
-                                Edited_Time, Transaction_Date, Record_Image, Vendor, Customer) VALUES ('{accounts_receivable_transaction+1}',
-                                '{values_invoice[f'-Invoice_Debit_Acct_{icb_session.num}-'][:5]}','13003', '{this_invoice_sales_tax}', 'Invoice {icb_session.this_invoice['Invoice_ID']} Sales Tax Payable', 
-                                '{icb_session.this_invoice['Tracking_Code']}', '{icb_session.current_time_display[0]}', '{icb_session.current_time_display[0]}', '{f"{now}"[:10]}', '{icb_session.this_invoice['Location']}', '', 
-                                '{icb_session.this_invoice['Customer_ID']}');"""
-                                added_transaction = db.execute_query(icb_session.connection, add_transaction_query)
-                                print(f"added_transaction: {added_transaction}")
-
-                                #update the invoice
-                                #update the invoice
-                                invoice_repo.update(invoice_id=icb_session.this_invoice['Invoice_ID'], status=values[f'-POS_Status_Input-'], edited_time=icb_session.current_time_display[0])
-                                update_pos_view(icb_session.window,values)
-                                invoice_date = f"{icb_session.this_invoice['Created_Time'].replace('Monday, ','')}"
-                                invoice_date = f"{invoice_date.replace('Tuesday, ','')}"
-                                invoice_date = f"{invoice_date.replace('Wednesday, ','')}"
-                                invoice_date = f"{invoice_date.replace('Thursday, ','')}"
-                                invoice_date = f"{invoice_date.replace('Friday, ','')}"
-                                invoice_date = f"{invoice_date.replace('Saturday, ','')}"
-                                invoice_date = f"{invoice_date.replace('Sunday, ','')}"
-                                search=re.search(r" ",invoice_date)
-                                invoice_date = invoice_date[:search.start()]
-                                generate_new_invoice(icb_session.window,values, invoice_date)
-                                
-                                #close the window
-                                payment_account_window.close()
-                    else:
-                        icb_session.console_log("Can't refund unpaid invoice.",icb_session.current_console_messages)
-                elif values['-POS_Status_Input-'] == "Canceled" and icb_session.this_invoice['Status'] != "Canceled" and icb_session.this_invoice['Status'] != 'Paid' and icb_session.this_invoice['Status'] != 'Refunded':
-                    
-                    invoice_id = values['-POS_Number_Display-']
-                    #print(invoice_id)
-                    check_paid_query = f"""SELECT Transaction_ID from {icb_session.ledger_name} WHERE Name = '{invoice_id}' AND Debit_Acct IS NOT '10006';"""
-                    paid_transactions = db.execute_read_query_dict(icb_session.connection,check_paid_query)
-                    invoice_repo = InvoiceRepository(icb_session.connection)
-                    icb_session.this_invoice = invoice_repo.get_by_id(invoice_id[8:])
-                    
-                    icb_session.this_invoice['Due_Date'] = f"{current_date}"
-                    #print(icb_session.this_invoice['Line_Items'])
-                    icb_session.these_line_items = ast.literal_eval(icb_session.this_invoice['Line_Items'])
-                    #print(icb_session.these_line_items)
-                    if paid_transactions == [] and icb_session.this_invoice['Status'] == "Due" or paid_transactions == [] and icb_session.this_invoice['Status'] == "Overdue":
-                                
-                        count_transactions_query = f"""SELECT COUNT(*) FROM {icb_session.ledger_name};"""
-                        transactions_count = db.execute_read_query_dict(icb_session.connection,count_transactions_query)
-                        #print(transactions_count)
-                        
-                        this_invoice_subtotal = int(icb_session.this_invoice['Subtotal'])
-                        accounts_receivable_transaction = int(transactions_count[0]['COUNT(*)'])+1
-                        add_transaction_query = f"""INSERT INTO {icb_session.ledger_name} (Transaction_ID, Credit_Acct, Debit_Acct, Amount, Name, Notes, Created_Time, 
-                        Edited_Time, Transaction_Date, Record_Image, Vendor, Customer) VALUES ('{accounts_receivable_transaction}','10006', '15001',
-                        '{this_invoice_subtotal}', 'Invoice {icb_session.this_invoice['Invoice_ID']}', 
-                        '{icb_session.this_invoice['Tracking_Code']}', '{icb_session.current_time_display[0]}', '{icb_session.current_time_display[0]}', '{f"{now}"[:10]}', '{icb_session.this_invoice['Location']}', '', 
-                        '{icb_session.this_invoice['Customer_ID']}');"""
-                        added_transaction = db.execute_query(icb_session.connection, add_transaction_query)
-                        
-                        print(f"added_transaction: {added_transaction}")
-
-                        this_invoice_sales_tax = int(icb_session.this_invoice['Sales_Tax'])
-                        accounts_receivable_transaction = int(transactions_count[0]['COUNT(*)'])+2
-                        add_transaction_query = f"""INSERT INTO {icb_session.ledger_name} (Transaction_ID, Credit_Acct, Debit_Acct, Amount, Name, Notes, Created_Time, 
-                        Edited_Time, Transaction_Date, Record_Image, Vendor, Customer) VALUES ('{accounts_receivable_transaction}','10006', '13003',
-                        '{this_invoice_sales_tax}', 'Invoice {icb_session.this_invoice['Invoice_ID']}', 
-                        '{icb_session.this_invoice['Tracking_Code']}', '{icb_session.current_time_display[0]}', '{icb_session.current_time_display[0]}', '{f"{now}"[:10]}', '{icb_session.this_invoice['Location']}', '', 
-                        '{icb_session.this_invoice['Customer_ID']}');"""
-                        added_transaction = db.execute_query(icb_session.connection, add_transaction_query)
-                        
-                        print(f"added_transaction: {added_transaction}")
-
-                        icb_session.this_invoice['Status'] = values['-POS_Status_Input-']
-                        #update the invoice
-                        #update the invoice
-                        invoice_repo.update(invoice_id=icb_session.this_invoice['Invoice_ID'], status=values[f'-POS_Status_Input-'], edited_time=icb_session.current_time_display[0])
-                        update_pos_view(icb_session.window,values)
-                        invoice_date = f"{icb_session.this_invoice['Created_Time'].replace('Monday, ','')}"
-                        invoice_date = f"{invoice_date.replace('Tuesday, ','')}"
-                        invoice_date = f"{invoice_date.replace('Wednesday, ','')}"
-                        invoice_date = f"{invoice_date.replace('Thursday, ','')}"
-                        invoice_date = f"{invoice_date.replace('Friday, ','')}"
-                        invoice_date = f"{invoice_date.replace('Saturday, ','')}"
-                        invoice_date = f"{invoice_date.replace('Sunday, ','')}"
-                        
-                        search=re.search(r" ",invoice_date)
-                        invoice_date = invoice_date[:search.start()]
-                        generate_new_invoice(icb_session.window,values, invoice_date)
-                    else:
-                        icb_session.console_log("Can't cancel paid invoice.",icb_session.current_console_messages)
-                else:
-                    icb_session.console_log("No changes made to invoice. Check input.",icb_session.current_console_messages)
-                    update_pos_view(icb_session.window,values)
-        #    window[f"-Business_Receipts_Repository_Label_{num}-"].update(text=f"""Receipts Repository Location: {values[f"-Business_Receipts_Repository_{num}-"]}""")
+                if change_invoice_status(icb_session, values):
+                    save_current_database(icb_session, reason="Save after invoice status change")
 #--------------------------------------------------
 #Test to toggle menu items enabled/disabled
 #menu_def[0][1][2] = "&Save Database As"
@@ -3514,25 +3646,9 @@ while True:
         else:
             function_triggered = False
         if function_triggered == True:
-            #Resynchronizes the time
-            icb_session.synchronized = synchronize_time(icb_session.window, icb_session.current_time_display)
-            if icb_session.synchronized[0] == "Yes":     
-                if int(f"""{icb_session.synchronized[1][1][-6:-4]}""") - int(icb_session.current_time_display[1][-6:-4]) > 0:
-                    icb_session.current_time_display = icb_session.synchronized[1]
-                    icb_session.guitimer = int(f"""{icb_session.synchronized[1][1][-6:-4]}""")
-                    icb_session.window['-Current_Time_Display-'].update(icb_session.current_time_display[0])
-                    #print(f"""Synchronized: {current_time_display[0]}\n{timer}""")
-                    if icb_session.guitimer >0:
-                        conditional_s = "s"
-                        if icb_session.guitimer == 1:
-                            conditional_s = ""
-                        icb_session.current_console_messages = icb_session.console_log(f"""Minute update delayed by {icb_session.guitimer} second{conditional_s}.""", icb_session.current_console_messages)
-                else:
-                    icb_session.guitimer = int(f"""{icb_session.synchronized[1][1][-6:-4]}""")
-            else:
-                icb_session.guitimer = int(f"""{icb_session.synchronized[1][1][-6:-4]}""")
-            
-        
+            refresh_clock_and_autosave(icb_session)
+
+
 icb_session.session_log_connection.close()
 if icb_session.connection:
     icb_session.connection.close()

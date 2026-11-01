@@ -48,7 +48,7 @@ class InvoiceRepository:
         logger.debug(f"get_by_id: Executing query: {query}")
         result = db.execute_read_query_dict(self.connection, query)
 
-        if result and len(result) > 0:
+        if isinstance(result, list) and len(result) > 0:
             return result[0]
         return None
 
@@ -96,7 +96,6 @@ class InvoiceRepository:
         Inserts a new invoice. If invoice_id is provided, it uses it (though AutoIncrement usually handles this).
         """
         # Note: Handling Invoice_ID if passed, otherwise letting AutoIncrement work if it was excluded from INSERT cols.
-        # However, the original code in iceberg.py explicitly inserts Invoice_ID in save_invoice_to_database.
         # "VALUES ({icb_session.this_invoice['Invoice_ID']}, ..."
         
         cols = "Customer_ID, Tracking_Code, Line_Items, Due_Date, Created_Time, Edited_Time, Subtotal, Sales_Tax, Total, Status, Payment_Method, Location"
@@ -165,7 +164,7 @@ class InvoiceRepository:
         """
         query = "SELECT COUNT(*) FROM tbl_Invoices;"
         result = db.execute_read_query_dict(self.connection, query)
-        if result and len(result) > 0:
+        if isinstance(result, list) and len(result) > 0:
             return result[0]['COUNT(*)']
         return 0
 

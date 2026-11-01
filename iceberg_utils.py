@@ -1,33 +1,17 @@
-import datetime
-import time
-from decimal import Decimal as dec
 import string
 import random
+from decimal import Decimal as dec
+
+import iceberg_time
 
 
 def get_current_time_info():
-    """Returns the current time information in string format."""
-    weekday = ""
-    if datetime.datetime.now().weekday() == 0:
-        weekday = "Monday"
-    if datetime.datetime.now().weekday() == 1:
-        weekday = "Tuesday"
-    if datetime.datetime.now().weekday() == 2:
-        weekday = "Wednesday"
-    if datetime.datetime.now().weekday() == 3:
-        weekday = "Thursday"
-    if datetime.datetime.now().weekday() == 4:
-        weekday = "Friday"
-    if datetime.datetime.now().weekday() == 5:
-        weekday = "Saturday"
-    if datetime.datetime.now().weekday() == 6:
-        weekday = "Sunday"
+    """Returns ``(display_time, display_timestamp)`` for the local timezone.
 
-    time_info = time.tzname[time.daylight]
-
-    current_time = f"""{weekday}, {datetime.datetime.now().month}/{datetime.datetime.now().day}/{datetime.datetime.now().year}  -  {format(datetime.datetime.now().hour,'02d')}:{format(datetime.datetime.now().minute,'02d')} {time_info}"""
-    current_timestamp = f"""{weekday}, {datetime.datetime.now().month}/{datetime.datetime.now().day}/{datetime.datetime.now().year}  -  {format(datetime.datetime.now().hour, '02d')}:{format(datetime.datetime.now().minute,'02d')}:{format(datetime.datetime.now().second,'02d')} {time_info}"""
-    return current_time, current_timestamp
+    Both strings use the neutral ``UTC+hh:mm`` offset instead of a localized
+    zone name.  See ``iceberg_time`` for the storage format used in databases.
+    """
+    return iceberg_time.get_current_time_info()
 
 
 def format_currency(integer, symbol="$"):
@@ -107,13 +91,14 @@ def format_currency(integer, symbol="$"):
 
 
 def convert_dollars_to_cents(dollars):
+    """Return cents for a dollar string, or None when it is not a number."""
+    text = f"{dollars}".replace("$", "").replace(",", "").strip()
+    if not text:
+        return None
     try:
-        dollars = f"{dollars}".replace("$","")
-        dollars = f"{dollars}".replace(",","")
-        return int(dec(dollars) * 100)
-    except Exception as e:
-        print(f"exception converting currency: {e}")
-        print(dollars)
+        return int(dec(text) * 100)
+    except Exception:
+        return None
 
 
 def id_generator(size=30, chars=string.ascii_uppercase + string.digits):

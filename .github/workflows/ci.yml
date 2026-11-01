@@ -1,0 +1,37 @@
+name: Release checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install system packages (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y gir1.2-webkit2-4.1 python3-gi
+      - name: Install jsdom for the page boot test
+        run: npm install --no-save jsdom@24
+      - name: Install dependencies from prebuilt wheels only
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --only-binary=:all: --no-binary proxy_tools -r requirements.txt
+          python -m pip install pyflakes
+      - name: Release checks
+        run: python scripts/check_release.py

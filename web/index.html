@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+<title>Iceberg Accounting Suite</title>
+<link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <div class="titlebar">
+    <div class="brand"><div class="badge">IC</div><span>Iceberg Accounting Suite</span></div>
+    <div class="clock" id="clock"></div>
+  </div>
+  <div class="content" id="content"></div>
+  <div class="run-status-bar" id="status-bar"></div>
+  <div class="modal-overlay" id="modal"></div>
+  <script src="routes.js"></script>
+  <script src="client.js"></script>
+  <script src="render.js"></script>
+  <script src="render_records.js"></script>
+  <script src="render_tools.js"></script>
+  <script>
+    // Without a session token in the URL (plain browser preview of the files), use the sample-data API.
+    if (!/[?&]token=/.test(window.location.search)) { document.write('<script src="mock.js"><\/script>'); }
+  </script>
+  <script src="app.js"></script>
+</body>
+</html>

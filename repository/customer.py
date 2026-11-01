@@ -36,11 +36,13 @@ class CustomerRepository:
         """
         Retrieves a customer by their Customer_ID.
         """
+        if customer_id is None or str(customer_id).strip() in ("", "None"):
+            return None
         query = f"SELECT * FROM tbl_Customers WHERE Customer_ID = {customer_id};"
         logger.debug(f"get_by_id: Executing query: {query}")
         result = db.execute_read_query_dict(self.connection, query)
         
-        if result and len(result) > 0:
+        if isinstance(result, list) and len(result) > 0:
             return result[0]
         return None
 

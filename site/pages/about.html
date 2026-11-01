@@ -1,0 +1,45 @@
+<!-- title: License, privacy, security, and project status | description: How Iceberg handles your data, what the license allows, how to keep your books secure, and where the project is going. -->
+<h1>About the project</h1>
+<p class="lead">What you agree to, how your data is handled, and where Iceberg is heading.</p>
+
+<h2 id="license">License</h2>
+<div class="panel">
+  <p>Iceberg Accounting Suite is free software under the <strong>MIT License</strong>. You may use it for any purpose, including commercially, copy it, change it, and redistribute it, provided the copyright notice and license text stay with it. It comes without warranty: you are responsible for checking your books and for keeping backups. The full text ships with the program (<code>LICENSE</code>) and is in the <a href="{{repo}}/blob/master/LICENSE">source repository</a>.</p>
+</div>
+
+<h2 id="privacy">Privacy and data storage</h2>
+<div class="panel">
+  <ul class="checks">
+    <li><strong>Everything stays on your computer.</strong> Iceberg has no account, no cloud service, and no telemetry: it sends no data anywhere, does not collect usage statistics, and does not check for updates.</li>
+    <li><strong>Your books are one encrypted file</strong> (<code>.icb</code>) in the data folder: <code>%LOCALAPPDATA%\Iceberg\databases</code> on Windows, <code>~/.local/share/iceberg/databases</code> on Linux. Backups (<code>backups/</code>) are copies of that encrypted file.</li>
+    <li><strong>Encryption:</strong> the database is encrypted with a 256-bit key in your <code>.icbkey</code> file using Fernet (AES-128-CBC with an HMAC-SHA256 signature), from the audited <code>cryptography</code> library. The key never leaves your machine and Iceberg cannot recover it for you.</li>
+    <li><strong>Not encrypted:</strong> receipt images and invoice PDFs in the receipts folder you chose, CSV exports you create, and the log file (which records actions such as "Transaction 12 added: Office rent" but no bank account numbers).</li>
+    <li><strong>The local interface</strong> is served to the window from a loopback-only address with a random port and a per-session token; nothing listens on your network.</li>
+  </ul>
+</div>
+
+<h2 id="security">Security guidance</h2>
+<div class="panel">
+  <ul class="checks">
+    <li><strong>Guard the filekey.</strong> Whoever holds the <code>.icbkey</code> can open the database. Store it separately from the <code>.icb</code> - a thumb drive, a password manager's file attachment, or an encrypted synced folder - and keep a copy in your backups.</li>
+    <li><strong>Back up the data folder and the key.</strong> Iceberg keeps the twenty most recent backups, but they live on the same disk as your books. Copy the data folder and the key somewhere else regularly.</li>
+    <li><strong>Download from the releases page only</strong> and verify the SHA-256 checksum before installing (see <a href="downloads.html#verify">Verify your download</a>).</li>
+    <li><strong>Use your operating system's protections:</strong> a user account with a password, full-disk encryption (BitLocker, LUKS), and current updates. Iceberg protects the file at rest; it cannot protect an unlocked session.</li>
+    <li><strong>Report security problems</strong> privately by opening an issue titled "Security" without details and asking for a contact, or through the repository's security policy if one is published.</li>
+  </ul>
+</div>
+
+<h2 id="status">Project status</h2>
+<div class="panel">
+  <p><span class="pill ok">Active</span> Version {{version}} is the first packaged release. Development follows the public roadmap of user stories in the repository; every change is covered by automated tests that run on Windows and Linux for Python 3.11-3.14.</p>
+  <h3>Delivered</h3>
+  <p>Dependable startup and saves; invoices, reconciliation, reports, validation, CSV exchange; the current interface; build, packaging, and release automation; this website.</p>
+  <h3>Planned or under consideration</h3>
+  <ul class="checks">
+    <li>macOS packages.</li>
+    <li>Multiple sales tax rates and per-line tax.</li>
+    <li>Statement import (CSV from the bank) straight into reconciliation.</li>
+    <li>Product inventory quantities.</li>
+  </ul>
+  <p>Known bugs and their status are tracked in <a href="{{repo}}/tree/master/bugs">bugs/</a>; the roadmap in <a href="{{repo}}/blob/master/user-stories/README.md">user-stories/</a>.</p>
+</div>

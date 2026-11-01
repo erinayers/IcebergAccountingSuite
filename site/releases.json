@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/iceberg-accounting/iceberg",
+  "releases": [
+    {
+      "version": "2.0.0",
+      "date": "2026-10-31",
+      "status": "current",
+      "notes": "First packaged release: new interface, invoices with history, reconciliation, reports, CSV exchange, atomic saves with backups, Python 3.11-3.14.",
+      "files": [
+        {"name": "Iceberg-2.0.0-windows-x64-setup.exe", "os": "Windows 10/11 (64-bit)", "kind": "Installer", "sha256": "pending - published with the release"},
+        {"name": "Iceberg-2.0.0-windows-x64.zip", "os": "Windows 10/11 (64-bit)", "kind": "Portable archive", "sha256": "pending - published with the release"},
+        {"name": "Iceberg-2.0.0-linux-x64.tar.gz", "os": "Linux x86-64 (glibc 2.28+)", "kind": "Archive with install.sh", "sha256": "pending - published with the release"}
+      ]
+    }
+  ]
+}

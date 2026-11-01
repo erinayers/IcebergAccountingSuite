@@ -34,7 +34,7 @@ class PropertyRepository:
         logger.debug(f"get: Executing query: {query}")
         result = db.execute_read_query_dict(self.connection, query)
         
-        if result and len(result) > 0 and 'Property_Value' in result[0]:
+        if isinstance(result, list) and len(result) > 0 and 'Property_Value' in result[0]:
             return result[0]['Property_Value']
         return None
 

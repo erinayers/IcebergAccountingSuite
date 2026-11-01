@@ -1,0 +1,5 @@
+Date,Name,Amount,Debit_Account,Credit_Account,Notes,Vendor
+2025-03-01,Office rent March,1200.00,11010,10002,Paid by check 1042,
+2025-03-04,Printer paper,42.18,11001,10002,,
+2025-03-10,Consulting fee received,2500.00,10002,15001,Invoice paid by transfer,
+2025-03-15,Owner draw,500.00,12001,10002,,

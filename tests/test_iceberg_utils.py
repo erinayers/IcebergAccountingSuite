@@ -3,7 +3,6 @@ from unittest.mock import patch, MagicMock
 import sys
 import os
 import datetime
-import time as base_time
 
 # Add parent directory to path to import iceberg
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -13,31 +12,17 @@ import string
 
 
 class TestIcebergUtils(unittest.TestCase):
-    @patch('iceberg_utils.datetime')
-    @patch('iceberg_utils.time')
-    def test_get_current_time_info(self, mock_time, mock_datetime):
-        # Setup mock for datetime.now()
-        # We use a real datetime object so methods like weekday(), month, etc work naturally
-        fixed_date = datetime.datetime(2023, 10, 27, 14, 30, 0)
-        
-        # mock_datetime is the module 'datetime' imported in iceberg.py
-        # We want mock_datetime.datetime.now() to return fixed_date
-        mock_datetime.datetime.now.return_value = fixed_date
-        
-        # Also need to ensure other attributes like timedelta are present if used (though get_current_time_info doesn't use it, others might)
-        # But get_current_time_info only uses datetime.datetime.now()
-        
-        # Setup time.tzname
-        mock_time.daylight = 0
-        mock_time.tzname = ('EST', 'EDT')
-        
-        expected_time_str = "Friday, 10/27/2023  -  14:30 EST"
-        expected_timestamp_str = "Friday, 10/27/2023  -  14:30:00 EST"
-        
-        result_time, result_timestamp = get_current_time_info()
-        
-        self.assertEqual(result_time, expected_time_str)
-        self.assertEqual(result_timestamp, expected_timestamp_str)
+    def test_get_current_time_info(self):
+        # The display strings come from iceberg_time: local time with a neutral
+        # numeric offset instead of a (possibly localized or wrong) zone name.
+        zone = datetime.timezone(datetime.timedelta(hours=-4))
+        fixed = datetime.datetime(2023, 10, 27, 14, 30, 5, tzinfo=zone)
+        with patch('iceberg_time.local_timezone', return_value=zone), \
+             patch('iceberg_time.utc_now', return_value=fixed):
+            result_time, result_timestamp = get_current_time_info()
+
+        self.assertEqual(result_time, "Friday, 10/27/2023  -  14:30 (UTC-04:00)")
+        self.assertEqual(result_timestamp, "Friday, 10/27/2023  -  14:30:05 (UTC-04:00)")
 
     def test_format_currency(self):
         # Test zero
