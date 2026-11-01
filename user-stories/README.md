@@ -103,6 +103,12 @@ for what's carried forward versus what's web-native.
 | [ST-043 — Multi-machine / cloud-sync safety guidance](ST-043-multi-machine-cloud-sync-safety-guidance.md) | Proposed |
 | [ST-044 — Extension points for reports/transitions/shortcuts](ST-044-extension-points-for-reports-transitions-and-shortcuts.md) | Proposed; optional |
 
+### P5 — AI-assisted forecasting and reporting: proposed, not started, deliberately last
+
+| Story | Status |
+|-------|--------|
+| [ST-045 — Local LLM plugin for forecasting and reporting narration](ST-045-local-llm-forecasting-and-reporting.md) | Proposed; needs validated demand + a runtime decision before scheduling |
+
 ## Suggested delivery order
 
 1. Resolve BUG-001 and BUG-002; establish a supported Python and OS matrix (ST-001, ST-002, ST-005).
@@ -113,7 +119,8 @@ for what's carried forward versus what's web-native.
 6. Publish the product, support, transparency, and verified download information on the website (ST-027–ST-031), once release artifacts and support processes are ready.
 7. Modernize navigation, layout, tables, and forms as a coherent UI update (ST-014–ST-020), with accessibility requirements included from the start (ST-011).
 8. Improve modularity and automate compatibility and release checks (ST-012, ST-013, ST-025).
-9. ST-041 (reconciliation SQL cleanup) is done. Continue the next phase with the remaining low-risk, high-value workflow fixes: inline custom-account creation and the repository SQL cleanup (ST-032, ST-042). Then extend core bookkeeping parity with bills/AP and recurring transactions (ST-033, ST-034). Add bank statement import and change history/undo once those are stable (ST-035, ST-038), followed by budgets, dashboard trend charts, and the 1099 summary (ST-036, ST-039, ST-040). Document multi-machine/cloud-sync safety whenever it's convenient (ST-043) — it's independent of the rest. Leave multi-currency (ST-037) for last — it is the largest and riskiest story and should get its own design review before scheduling. Treat extension points (ST-044) as optional; only take it on if the closed-registry pattern becomes a real contributor pain point.
+9. ST-041 (reconciliation SQL cleanup) is done. Continue the next phase with the remaining low-risk, high-value workflow fixes: inline custom-account creation and the repository SQL cleanup (ST-032, ST-042). Then extend core bookkeeping parity with bills/AP and recurring transactions (ST-033, ST-034). Add bank statement import and change history/undo once those are stable (ST-035, ST-038), followed by budgets, dashboard trend charts, and the 1099 summary (ST-036, ST-039, ST-040). Document multi-machine/cloud-sync safety whenever it's convenient (ST-043) — it's independent of the rest. Leave multi-currency (ST-037) for last among the P3/P4 work — it is the largest and riskiest story there and should get its own design review before scheduling. Treat extension points (ST-044) as optional; only take it on if the closed-registry pattern becomes a real contributor pain point.
+10. ST-045 (local LLM plugin) comes last, after everything above. It is the largest new dependency surface in the whole roadmap and must not be started before its own validated-demand check and runtime decision (see the story's scope notes) — treat it as a separate, future initiative rather than part of the normal P3/P4 sequence.
 
 ## Adding a new story
 
