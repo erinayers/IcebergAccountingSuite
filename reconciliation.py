@@ -42,8 +42,26 @@ class ReconciliationError(Exception):
     pass
 
 
+def _rows(connection, query, params=()):
+    """Run a parameterised query and return the rows as plain dicts."""
+    cursor = connection.execute(query, params)
+    columns = [c[0] for c in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def _one(connection, query, params=()):
+    rows = _rows(connection, query, params)
+    return rows[0] if rows else None
+
+
 def ensure_schema(connection, ledger_name):
-    """Idempotent migration: reconciled flag on the ledger, history table."""
+    """Idempotent migration: reconciled flag on the ledger, history table.
+
+    ``ledger_name`` and ``RECONCILED_COLUMN`` are identifiers, not values, so
+    they cannot be bound as ``?`` parameters; both are internally derived
+    (``books.ledger_table_name`` sanitises the ledger name) rather than raw
+    user text, so building them into the DDL string here is safe.
+    """
     if RECONCILED_COLUMN not in accounting.ledger_columns(connection, ledger_name):
         db.execute_query(connection, f"ALTER TABLE {ledger_name} ADD COLUMN {RECONCILED_COLUMN} DATE;")
     db.create_tables(connection, RECONCILIATIONS_SCHEMA)
@@ -71,10 +89,10 @@ def start(connection, ledger_name, account_id, statement_date):
     """
     ensure_schema(connection, ledger_name)
     account_id = str(account_id)
-    rows = db.execute_read_query_dict(
+    rows = _rows(
         connection,
-        f"SELECT * FROM {ledger_name} WHERE Debit_Acct = '{account_id}' OR Credit_Acct = '{account_id}' "
-        f"ORDER BY Transaction_Date, Transaction_ID;",
+        f"SELECT * FROM {ledger_name} WHERE Debit_Acct = ? OR Credit_Acct = ? ORDER BY Transaction_Date, Transaction_ID;",
+        (account_id, account_id),
     )
     if not isinstance(rows, list):
         rows = []
@@ -134,27 +152,38 @@ def complete(connection, ledger_name, session, cleared_ids, statement_balance):
         raise ReconciliationError("No transactions were cleared.")
     ids = sorted(int(i) for i in cleared_ids)
     if ids:
-        id_list = ",".join(str(i) for i in ids)
-        db.execute_query(
-            connection,
-            f"UPDATE {ledger_name} SET {RECONCILED_COLUMN} = '{session['statement_date']}' WHERE Transaction_ID IN ({id_list});",
+        placeholders = ",".join("?" * len(ids))
+        connection.execute(
+            f"UPDATE {ledger_name} SET {RECONCILED_COLUMN} = ? WHERE Transaction_ID IN ({placeholders});",
+            (session["statement_date"], *ids),
         )
-    db.execute_query(
-        connection,
-        f"""INSERT INTO tbl_Reconciliations (Account_ID, Statement_Date, Statement_Balance, Cleared_Balance, Cleared_Count, Transaction_IDs, Created_Time)
-        VALUES ('{session['account_id']}', '{session['statement_date']}', {int(statement_balance)}, {summary['cleared_balance']}, {len(ids)}, '{",".join(str(i) for i in ids)}', '{iceberg_time.storage_timestamp()}');""",
+    connection.execute(
+        """INSERT INTO tbl_Reconciliations (Account_ID, Statement_Date, Statement_Balance, Cleared_Balance, Cleared_Count, Transaction_IDs, Created_Time)
+        VALUES (?, ?, ?, ?, ?, ?, ?);""",
+        (
+            session["account_id"],
+            session["statement_date"],
+            int(statement_balance),
+            summary["cleared_balance"],
+            len(ids),
+            ",".join(str(i) for i in ids),
+            iceberg_time.storage_timestamp(),
+        ),
     )
+    connection.commit()
     return summary
 
 
 def history(connection, account_id=None):
     """Completed reconciliations, newest first."""
     db.create_tables(connection, RECONCILIATIONS_SCHEMA)
-    where = f" WHERE Account_ID = '{account_id}'" if account_id else ""
-    rows = db.execute_read_query_dict(
-        connection, f"SELECT * FROM tbl_Reconciliations{where} ORDER BY Statement_Date DESC, Reconciliation_ID DESC;"
-    )
-    return rows if isinstance(rows, list) else []
+    if account_id:
+        return _rows(
+            connection,
+            "SELECT * FROM tbl_Reconciliations WHERE Account_ID = ? ORDER BY Statement_Date DESC, Reconciliation_ID DESC;",
+            (str(account_id),),
+        )
+    return _rows(connection, "SELECT * FROM tbl_Reconciliations ORDER BY Statement_Date DESC, Reconciliation_ID DESC;")
 
 
 def undo_last(connection, ledger_name, account_id):
@@ -165,9 +194,12 @@ def undo_last(connection, ledger_name, account_id):
         raise ReconciliationError("There is no reconciliation to undo for this account.")
     record = last[0]
     if record["Transaction_IDs"]:
-        db.execute_query(
-            connection,
-            f"UPDATE {ledger_name} SET {RECONCILED_COLUMN} = NULL WHERE Transaction_ID IN ({record['Transaction_IDs']});",
+        ids = [int(i) for i in record["Transaction_IDs"].split(",") if i]
+        placeholders = ",".join("?" * len(ids))
+        connection.execute(
+            f"UPDATE {ledger_name} SET {RECONCILED_COLUMN} = NULL WHERE Transaction_ID IN ({placeholders});",
+            tuple(ids),
         )
-    db.execute_query(connection, f"DELETE FROM tbl_Reconciliations WHERE Reconciliation_ID = {record['Reconciliation_ID']};")
+    connection.execute("DELETE FROM tbl_Reconciliations WHERE Reconciliation_ID = ?;", (int(record["Reconciliation_ID"]),))
+    connection.commit()
     return record
